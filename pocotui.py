@@ -1588,6 +1588,26 @@ HELP = [
 ]
 
 
+def snort_menu(app):
+    def build(a):
+        bin_path = which("snort")
+        running = False
+        if bin_path:
+            rc, out = sh("pgrep -f snort", timeout=2)
+            running = rc == 0
+        items = [
+            Item("Binary", lambda a: None, value=lambda a: bin_path or "tidak ditemukan"),
+            Item("Status", lambda a: None, value=lambda a: "berjalan" if running else "mati"),
+        ]
+        if bin_path:
+            if running:
+                items.append(Item("Hentikan snort", lambda a: sh("pkill -f snort"), value=""))
+            else:
+                items.append(Item("Jalankan snort", lambda a: sh("snort -A console -q -c /etc/snort/snort.conf -i eth0 &", timeout=3), value=""))
+            items.append(Item("Lihat log", lambda a: a.push(TextView("Snort log", (rd("/var/log/snort/alert") or "(kosong)").splitlines()[-50:])), value=""))
+        return items
+    return MenuScreen("Snort", build)
+
 def main_menu(app):
     def build(a):
         n = len((a.stats.d or {}).get("clients") or [])
@@ -1600,6 +1620,7 @@ def main_menu(app):
             Item("Pengaturan Hotspot", lambda a: a.push(wifi_menu(a))),
             Item("Tampilan & Daya", lambda a: a.push(display_menu(a))),
             Item("Log", lambda a: a.push(LogScreen())),
+            Item("Snort", lambda a: a.push(snort_menu(a))),
             Item("Sistem", lambda a: a.push(system_menu(a))),
             Item("Bantuan / peta tombol", lambda a: a.push(TextView("Bantuan", HELP))),
             Item("Tutup menu", lambda a: a.pop()),
