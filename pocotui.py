@@ -1241,14 +1241,20 @@ class DashScreen:
         c = app.c
         dim = c["dim"]
         rows = []
-        rc, out = sh("mmcli -m 0", timeout=3)
+        now = time.time()
+        cache = getattr(app, "_lte_cache", None)
+        if cache is None or now - cache[0] > 5:
+            rc, out = sh("mmcli -m 0", timeout=3)
+            rc2, out2 = sh("mmcli -m 0", timeout=4)
+            rc3, out3 = sh("mmcli -m 0 --command='AT+GSN' 2>&1", timeout=5)
+            app._lte_cache = (now, rc, out, rc2, out2, rc3, out3)
+        _, rc, out, rc2, out2, rc3, out3 = app._lte_cache
         if rc == 0:
             for key in ("state:", "access tech:", "signal quality:", "power state:", "manufacturer:", "model:"):
                 for l in out.splitlines():
                     if key in l:
                         rows.append([(key.replace(":", "").ljust(9), dim), (l.split(":", 1)[-1].strip(), c["wh"])])
-            # operator name dari mmcli 3GPP
-            rc2, out2 = sh("mmcli -m 0", timeout=4)
+            # operator name dari mmcli 3GPP (cached)
             for l in (out2 or "").splitlines():
                 if "operator name" in l.lower():
                     rows.append([("Operator ", dim), (l.split(":", 1)[-1].strip(), c["acc"])])
@@ -1258,8 +1264,7 @@ class DashScreen:
                     rows.append([("Reg      ", dim), (l.split(":", 1)[-1].strip(), c["acc"])])
                 elif "packet service state" in l.lower():
                     rows.append([("Pkt state", dim), (l.split(":", 1)[-1].strip(), c["dim"])])
-            # imei
-            rc3, out3 = sh("mmcli -m 0 --command='AT+GSN' 2>&1", timeout=5)
+            # imei (cached)
             if rc3 == 0 and out3:
                 import re
                 m = re.findall(r'\d{15}', out3)
@@ -1278,16 +1283,69 @@ class DashScreen:
         c = app.c
         dim = c["dim"]
         rows = []
-        # enable gps
-        sh("mmcli -m 0 --location-enable-gps-nmea 2>/dev/null", timeout=3)
-        sh("mmcli -m 0 --location-enable-gps-raw 2>/dev/null", timeout=3)
-        rc2, out2 = sh("mmcli -m 0 --location-get", timeout=4)
+        now = time.time()
+        cache = getattr(app, "_gps_cache", None)
+        if cache is None or now - cache[0] > 5:
+            sh("mmcli -m 0 --location-enable-gps-nmea 2>/dev/null", timeout=3)
+            sh("mmcli -m 0 --location-enable-gps-raw 2>/dev/null", timeout=3)
+            rc2, out2 = sh("mmcli -m 0 --location-get", timeout=4)
+            app._gps_cache = (now, rc2, out2)
+        _, rc2, out2 = app._gps_cache
+        lat = lon = alt = sats = hdop = fix = speed = None
         if rc2 == 0:
-            for l in out2.splitlines():
-                if l.strip() and not l.strip().startswith("-"):
-                    rows.append([("GPS      ", dim), (l.strip()[:inner - 10], c["wh"])])
+            # parse NMEA GGA
+            for l in (out2 or "").splitlines():
+                l = l.strip()
+                if "GGA" in l:
+                    parts = l.split(",")
+                    try:
+                        # lat
+                        if parts[2] and parts[3]:
+                            la = float(parts[2]); lad = int(la/100); lam = la - lad*100
+                            lat = lad + lam/60.0
+                            if parts[3] == "S": lat = -lat
+                        if parts[4] and parts[5]:
+                            lo = float(parts[4]); lod = int(lo/100); lom = lo - lod*100
+                            lon = lod + lom/60.0
+                            if parts[5] == "W": lon = -lon
+                        fix = parts[6]
+                        sats = parts[7]
+                        hdop = parts[8]
+                        alt = parts[9]
+                    except Exception:
+                        pass
+                if "RMC" in l:
+                    parts = l.split(",")
+                    try:
+                        if parts[7]:
+                            speed = float(parts[7]) * 1.852  # knots -> km/h
+                    except Exception:
+                        pass
+        if lat is not None and lon is not None:
+            rows.append([("Lat      ", dim), ("%.6f" % lat, c["wh"])])
+            rows.append([("Lon      ", dim), ("%.6f" % lon, c["wh"])])
+            rows.append([("Alt      ", dim), ("%s m" % alt if alt else "n/a", c["wh"])])
+            rows.append([("Satelit  ", dim), (sats or "n/a", c["wh"])])
+            rows.append([("HDOP     ", dim), (hdop or "n/a", c["wh"])])
+            rows.append([("Fix      ", dim), ({"0":"no fix","1":"GPS","2":"DGPS","3":"PPS","4":"RTK","5":"FRTK","6":"est"}.get(fix, fix or "n/a"), c["good"] if fix not in (None,"0","") else c["bad"])])
+            if speed is not None:
+                rows.append([("Speed    ", dim), ("%.1f km/h" % speed, c["wh"])])
+            # akurasi perkiraan dari hdop
+            try:
+                acc = float(hdop) * 5 if hdop else None
+                if acc:
+                    rows.append([("Akurasi  ", dim), ("~%.0f m" % acc, c["wh"])])
+            except Exception:
+                pass
+            rows.append([("Mode     ", dim), ("3D" if (fix in ("1","2","3","4","5","6") and float(alt or 0) != 0) else "2D", c["wh"])])
         else:
-            rows.append([("GPS      ", dim), ("tidak tersedia", c["dim"])])
+            # fallback: tampilkan raw
+            if rc2 == 0:
+                for l in (out2 or "").splitlines():
+                    if l.strip() and not l.strip().startswith("-"):
+                        rows.append([("GPS      ", dim), (l.strip()[:inner - 10], c["wh"])])
+            else:
+                rows.append([("GPS      ", dim), ("tidak tersedia", c["dim"])])
         return rows or [[("GPS      ", dim), ("n/a", c["dim"])]]
 
     # -- tab: klien ----------------------------------------------------------------
@@ -1669,7 +1727,7 @@ def snort_menu(app):
         cfg = find_cfg()
         items = [
             Item("Binary", lambda a: None, value=lambda a: bin_path or "tidak ditemukan"),
-            Item("Status", lambda a: None, value=lambda a: "berjalan" if running else "mati"),
+            Item("Status", lambda a: None, value=lambda a: "berjalan" if (bin_path and sh("pgrep -f snort", timeout=2)[0] == 0) else "mati"),
             Item("Config", lambda a: None, value=lambda a: cfg or "tidak ditemukan"),
         ]
         if bin_path and cfg:
@@ -1706,7 +1764,7 @@ def suricata_menu(app):
         cfg = find_cfg()
         items = [
             Item("Binary", lambda a: None, value=lambda a: bin_path or "tidak ditemukan"),
-            Item("Status", lambda a: None, value=lambda a: "berjalan" if running else "mati"),
+            Item("Status", lambda a: None, value=lambda a: "berjalan" if (bin_path and sh("pgrep -f suricata", timeout=2)[0] == 0) else "mati"),
             Item("Config", lambda a: None, value=lambda a: cfg or "tidak ditemukan"),
         ]
         if bin_path and cfg:
@@ -1859,6 +1917,34 @@ DNS_PRESETS = [("Cloudflare 1.1.1.1", ["1.1.1.1", "1.0.0.1"]), ("Google 8.8.8.8"
 SUBNETS = ["192.168.50.0/24", "10.42.0.0/24", "172.20.0.0/24", "192.168.100.0/24"]
 
 
+def switch_upstream(app):
+    cur = app.cfg["upstream"]
+    if cur == "wlan0":
+        new = "rmnet_ipa0"
+    elif cur == "rmnet_ipa0":
+        new = "wlan0"
+    else:
+        new = "wlan0"
+    if not os.path.isdir("/sys/class/net/" + new):
+        app.toast("Interface %s tidak ada" % new, "bad", 4)
+        return
+    # periksa IP & rute default pada interface target
+    rc, out = sh("ip -4 -o addr show dev %s" % new, timeout=2)
+    has_ip = bool(re.search(r"inet \d", out or ""))
+    rc2, out2 = sh("ip route show default dev %s" % new, timeout=2)
+    has_route = bool(out2.strip())
+    app.cfg["upstream"] = new
+    app.cfg.save()
+    app.log("upstream switch: %s -> %s (ip=%s route=%s)" % (cur, new, has_ip, has_route))
+    if app.hs.state == "on":
+        restart_hotspot(app)
+    else:
+        app.toast("Upstream: %s (aktifkan hotspot untuk menerapkan)" % new, "info", 4)
+    if not has_ip:
+        app.toast("PERINGATAN: %s belum punya IP" % new, "warn", 5)
+    if not has_route:
+        app.toast("PERINGATAN: %s belum punya rute default" % new, "warn", 5)
+
 def network_menu(app):
     def pick_dns(a):
         cur = tuple(a.cfg["dns"])
@@ -1875,6 +1961,7 @@ def network_menu(app):
     return MenuScreen("Jaringan", lambda a: [
         Item("Interface upstream", pick_up, value=lambda a: a.cfg["upstream"]),
         Item("Bagikan internet (NAT)", lambda a: toggle(a, "nat"), value=lambda a: "ON" if a.cfg["nat"] else "OFF"),
+        Item("Pindah upstream wlan0 ↔ rmnet_ipa0", lambda a: switch_upstream(a), value=lambda a: a.cfg["upstream"]),
         Item("DNS klien", pick_dns, value=lambda a: a.cfg["dns"][0]),
         Item("Subnet hotspot", pick_sub, value=lambda a: a.cfg["subnet"]),
         Item("Tes ping internet", ping_test),
