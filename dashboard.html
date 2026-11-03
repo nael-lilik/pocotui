@@ -1,0 +1,172 @@
+<!doctype html>
+<html lang="id">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>POCO-TUI Dashboard</title>
+<style>
+  :root{--bg:#0a0f14;--panel:#111820;--fg:#cdd9e5;--dim:#6b7a8a;--acc:#4fd1c5;--good:#5fd38d;--warn:#f5c542;--bad:#f36b6b;--border:#1f2a36}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
+  header{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border);background:#0d131a}
+  header .title{color:var(--acc);font-weight:700}
+  header .meta{color:var(--dim);font-size:12px}
+  .tabs{display:flex;gap:4px;padding:8px 14px;border-bottom:1px solid var(--border)}
+  .tab{padding:6px 12px;border:1px solid var(--border);border-radius:6px;cursor:pointer;color:var(--dim);background:#0d131a}
+  .tab.active{color:var(--acc);border-color:var(--acc);background:#0f1b22}
+  main{padding:12px 14px;display:grid;gap:12px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+  @media(max-width:800px){.grid{grid-template-columns:1fr}}
+  .panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+  .panel h3{margin:0 0 8px;font-size:12px;letter-spacing:1px;color:var(--acc)}
+  .row{display:flex;justify-content:space-between;gap:8px;padding:2px 0;border-bottom:1px dotted #1a2430}
+  .row:last-child{border-bottom:none}
+  .label{color:var(--dim)}
+  .val{color:var(--fg)}
+  .good{color:var(--good)} .warn{color:var(--warn)} .bad{color:var(--bad)}
+  .bar{height:8px;background:#0d131a;border-radius:4px;overflow:hidden;margin:0 6px;flex:1}
+  .bar>div{height:100%;background:var(--acc)}
+  .spark{display:inline-block;vertical-align:middle}
+  .log{height:220px;overflow:auto;background:#080c10;border:1px solid var(--border);border-radius:6px;padding:8px;font-size:11px;white-space:pre-wrap}
+  .footer{padding:8px 14px;color:var(--dim);border-top:1px solid var(--border);font-size:11px}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th,td{padding:4px 6px;border-bottom:1px solid #1a2430;text-align:left}
+  th{color:var(--acc)}
+</style>
+</head>
+<body>
+<header>
+  <div class="title">POCO-TUI Dashboard</div>
+  <div class="meta" id="clock"></div>
+</header>
+<div class="tabs">
+  <div class="tab active" data-tab="overview">Ringkasan</div>
+  <div class="tab" data-tab="clients">Klien</div>
+  <div class="tab" data-tab="net">Jaringan</div>
+  <div class="tab" data-tab="lte">LTE</div>
+  <div class="tab" data-tab="gps">GPS</div>
+  <div class="tab" data-tab="ids">Snort/Suricata</div>
+</div>
+<main>
+  <section id="overview" class="view">
+    <div class="grid">
+      <div class="panel">
+        <h3>HOTSPOT</h3>
+        <div class="row"><span class="label">Status</span><span class="val good">● AKTIF</span></div>
+        <div class="row"><span class="label">SSID</span><span class="val">PocoF1-Hotspot</span></div>
+        <div class="row"><span class="label">Sandi</span><span class="val">**********</span></div>
+        <div class="row"><span class="label">Radio</span><span class="val">ap0  2.4 GHz  CH 6  WPA2</span></div>
+        <div class="row"><span class="label">Gateway</span><span class="val">192.168.50.1/24</span></div>
+        <div class="row"><span class="label">Upstream</span><span class="val">wlan0  10.x.x.x</span></div>
+        <div class="row"><span class="label">Internet</span><span class="val good">● online  42 ms</span></div>
+        <div class="row"><span class="label">Klien</span><span class="val">2 / 8</span></div>
+        <div class="row"><span class="label">hostapd</span><span class="val good">● aktif</span></div>
+        <div class="row"><span class="label">dnsmasq</span><span class="val good">● aktif</span></div>
+        <div class="row"><span class="label">ip_fwd</span><span class="val good">● 1</span></div>
+        <div class="row"><span class="label">NAT</span><span class="val">aktif</span></div>
+      </div>
+      <div class="panel">
+        <h3>SISTEM</h3>
+        <div class="row"><span class="label">CPU</span><div class="bar"><div style="width:34%"></div></div><span class="val">34%  1.8GHz</span></div>
+        <div class="row"><span class="label">RAM</span><div class="bar"><div style="width:52%"></div></div><span class="val">1.6/3.0 GB</span></div>
+        <div class="row"><span class="label">Baterai</span><div class="bar"><div style="width:78%;background:var(--good)"></div></div><span class="val">78%  Dipakai</span></div>
+        <div class="row"><span class="label">Disk</span><div class="bar"><div style="width:41%"></div></div><span class="val">4.1/10 GB</span></div>
+        <div class="row"><span class="label">Load</span><span class="val">0.42 0.38 0.31</span></div>
+        <div class="row"><span class="label">Suhu</span><span class="val">41.2°C</span></div>
+        <div class="row"><span class="label">Aktif</span><span class="val">02:14:33</span></div>
+      </div>
+      <div class="panel">
+        <h3>JARINGAN</h3>
+        <div class="row"><span class="label">↓ klien</span><span class="val">1.2 MB/s</span></div>
+        <div class="row"><span class="label">↑ klien</span><span class="val">0.3 MB/s</span></div>
+        <div class="row"><span class="label">↓ upstream</span><span class="val">0.4 MB/s</span></div>
+        <div class="row"><span class="label">↑ upstream</span><span class="val">1.1 MB/s</span></div>
+      </div>
+      <div class="panel">
+        <h3>MODEM / LTE / GPS</h3>
+        <div class="row"><span class="label">State</span><span class="val good">registered</span></div>
+        <div class="row"><span class="label">Access tech</span><span class="val">lte</span></div>
+        <div class="row"><span class="label">Signal</span><span class="val">78%</span></div>
+        <div class="row"><span class="label">Power</span><span class="val">on</span></div>
+        <div class="row"><span class="label">GPS</span><span class="val warn">tidak tersedia</span></div>
+      </div>
+    </div>
+  </section>
+  <section id="clients" class="view" hidden>
+    <div class="panel">
+      <h3>KLIEN TERHUBUNG</h3>
+      <table>
+        <thead><tr><th>MAC</th><th>IP</th><th>Hostname</th><th>RX/TX</th></tr></thead>
+        <tbody>
+          <tr><td>aa:bb:cc:dd:ee:01</td><td>192.168.50.101</td><td>phone-1</td><td>12 MB / 3 MB</td></tr>
+          <tr><td>aa:bb:cc:dd:ee:02</td><td>192.168.50.102</td><td>laptop</td><td>8 MB / 1 MB</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+  <section id="net" class="view" hidden>
+    <div class="panel">
+      <h3>GRAFIK (sparkline placeholder)</h3>
+      <div class="log">↓ klien  ▁▂▃▅▇▆▅▃▂▁▂▃▅▇
+↑ klien  ▁▁▂▃▃▂▁▁▂▃▃▂▁▁
+↓ upstr  ▁▂▂▃▃▂▁▁▂▂▃▃▂▁
+↑ upstr  ▁▁▂▃▅▇▆▅▃▂▁▂▃▅</div>
+    </div>
+  </section>
+  <section id="lte" class="view" hidden>
+    <div class="panel">
+      <h3>LTE</h3>
+      <div class="row"><span class="label">Manufacturer</span><span class="val">QUALCOMM INCORPORATED</span></div>
+      <div class="row"><span class="label">Model</span><span class="val">0</span></div>
+      <div class="row"><span class="label">Firmware</span><span class="val">AT4.0.c2.6-00335</span></div>
+      <div class="row"><span class="label">State</span><span class="val good">registered</span></div>
+      <div class="row"><span class="label">Access tech</span><span class="val">lte</span></div>
+      <div class="row"><span class="label">Signal quality</span><span class="val">78%</span></div>
+      <div class="row"><span class="label">Power state</span><span class="val">on</span></div>
+    </div>
+  </section>
+  <section id="gps" class="view" hidden>
+    <div class="panel">
+      <h3>GPS</h3>
+      <div class="row"><span class="label">Status</span><span class="val warn">tidak tersedia (gpsd belum aktif)</span></div>
+    </div>
+  </section>
+  <section id="ids" class="view" hidden>
+    <div class="grid">
+      <div class="panel">
+        <h3>SNORT</h3>
+        <div class="row"><span class="label">Binary</span><span class="val good">/usr/sbin/snort</span></div>
+        <div class="row"><span class="label">Status</span><span class="val good">berjalan</span></div>
+        <div class="row"><span class="label">Config</span><span class="val">/etc/snort/snort.lua</span></div>
+      </div>
+      <div class="panel">
+        <h3>SURICATA</h3>
+        <div class="row"><span class="label">Binary</span><span class="val good">/usr/sbin/suricata</span></div>
+        <div class="row"><span class="label">Status</span><span class="val good">berjalan</span></div>
+        <div class="row"><span class="label">Config</span><span class="val">/etc/suricata/suricata.yaml</span></div>
+        <div class="row"><span class="label">Rules</span><span class="val">53359 loaded</span></div>
+      </div>
+    </div>
+    <div class="panel" style="margin-top:12px">
+      <h3>LOG (last 10)</h3>
+      <div class="log">11:56.233  ET INFO DNS Query to Alibaba Cloud CDN Domain
+11:56.646  ET INFO Observed Alibaba Cloud CDN Domain (TLS SNI)
+11:57.231  SURICATA Ethertype unknown
+11:57.232  SURICATA Ethertype unknown</div>
+    </div>
+  </section>
+</main>
+<div class="footer">POCO-TUI Web Dashboard — data simulasi. Refresh manual.</div>
+<script>
+  const tabs=document.querySelectorAll('.tab');
+  tabs.forEach(t=>t.addEventListener('click',()=>{
+    tabs.forEach(x=>x.classList.remove('active'));
+    t.classList.add('active');
+    document.querySelectorAll('.view').forEach(v=>v.hidden=true);
+    document.getElementById(t.dataset.tab).hidden=false;
+  }));
+  function clock(){document.getElementById('clock').textContent=new Date().toLocaleTimeString('id-ID');}
+  clock();setInterval(clock,1000);
+</script>
+</body>
+</html>

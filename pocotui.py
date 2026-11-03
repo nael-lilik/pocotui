@@ -1113,18 +1113,24 @@ class DashScreen:
         inner = lw - 4
         panels = [("HOTSPOT", self.rows_hotspot(app, d, inner)),
                   ("JARINGAN", self.rows_net(app, d, inner)),
-                  ("SISTEM", self.rows_sys(app, d, (w - cw) - 4 if two else inner))]
+                  ("SISTEM", self.rows_sys(app, d, (w - cw) - 4 if two else inner)),
+                  ("LTE", self.rows_lte(app, d, (w - cw) - 4 if two else inner)),
+                  ("GPS", self.rows_gps(app, d, (w - cw) - 4 if two else inner))]
         if two:
             y = y0
             for t, r in panels[:2]:
-                y += app.panel(y, 0, lw, t, r, y1 - y)
-            app.panel(y0, cw, w - cw, panels[2][0], panels[2][1], y1 - y0)
+                y += app.panel(y, 0, lw, t, r, (y1 - y0) // 2)
+            # right column: sistem then modem
+            half = (y1 - y0) // 2
+            y2 = y0
+            y2 += app.panel(y2, cw, w - cw, panels[2][0], panels[2][1], half)
+            app.panel(y2, cw, w - cw, panels[3][0], panels[3][1], y1 - y2)
         else:
             y = y0
             for t, r in panels:
                 if y1 - y < 3:
                     break
-                y += app.panel(y, 0, w, t, r, y1 - y)
+                y += app.panel(y, 0, w, t, r, (y1 - y0) // 4)
 
     def rows_hotspot(self, app, d, inner):
         c, S, hs, cfg = app.c, app.sym, app.hs, app.cfg
@@ -1230,6 +1236,59 @@ class DashScreen:
         rows.append([("Load     ", dim), ("%.2f %.2f %.2f" % ld, c["wh"]),
                      ("   Aktif " + fmt_dur(d.get("uptime", 0)), dim)])
         return rows
+
+    def rows_lte(self, app, d, inner):
+        c = app.c
+        dim = c["dim"]
+        rows = []
+        rc, out = sh("mmcli -m 0", timeout=3)
+        if rc == 0:
+            for key in ("state:", "access tech:", "signal quality:", "power state:", "manufacturer:", "model:"):
+                for l in out.splitlines():
+                    if key in l:
+                        rows.append([(key.replace(":", "").ljust(9), dim), (l.split(":", 1)[-1].strip(), c["wh"])])
+            # operator name dari mmcli 3GPP
+            rc2, out2 = sh("mmcli -m 0", timeout=4)
+            for l in (out2 or "").splitlines():
+                if "operator name" in l.lower():
+                    rows.append([("Operator ", dim), (l.split(":", 1)[-1].strip(), c["acc"])])
+                elif "operator id" in l.lower():
+                    rows.append([("Op ID    ", dim), (l.split(":", 1)[-1].strip(), c["dim"])])
+                elif "registration:" in l.lower():
+                    rows.append([("Reg      ", dim), (l.split(":", 1)[-1].strip(), c["acc"])])
+                elif "packet service state" in l.lower():
+                    rows.append([("Pkt state", dim), (l.split(":", 1)[-1].strip(), c["dim"])])
+            # imei
+            rc3, out3 = sh("mmcli -m 0 --command='AT+GSN' 2>&1", timeout=5)
+            if rc3 == 0 and out3:
+                import re
+                m = re.findall(r'\d{15}', out3)
+                if m:
+                    rows.append([("IMEI     ", dim), (m[0], c["wh"])])
+            else:
+                # from equipment id
+                for l in out.splitlines():
+                    if "equipment id" in l.lower():
+                        rows.append([("IMEI     ", dim), (l.split(":", 1)[-1].strip(), c["wh"])])
+        else:
+            rows.append([("Modem    ", dim), ("tidak ditemukan", c["bad"])])
+        return rows or [[("Modem    ", dim), ("n/a", c["dim"])]]
+
+    def rows_gps(self, app, d, inner):
+        c = app.c
+        dim = c["dim"]
+        rows = []
+        # enable gps
+        sh("mmcli -m 0 --location-enable-gps-nmea 2>/dev/null", timeout=3)
+        sh("mmcli -m 0 --location-enable-gps-raw 2>/dev/null", timeout=3)
+        rc2, out2 = sh("mmcli -m 0 --location-get", timeout=4)
+        if rc2 == 0:
+            for l in out2.splitlines():
+                if l.strip() and not l.strip().startswith("-"):
+                    rows.append([("GPS      ", dim), (l.strip()[:inner - 10], c["wh"])])
+        else:
+            rows.append([("GPS      ", dim), ("tidak tersedia", c["dim"])])
+        return rows or [[("GPS      ", dim), ("n/a", c["dim"])]]
 
     # -- tab: klien ----------------------------------------------------------------
     def cl(self, app, d, y0, y1, w):
@@ -1589,24 +1648,137 @@ HELP = [
 
 
 def snort_menu(app):
+    def find_cfg():
+        for p in ("/etc/snort/snort.lua", "/etc/snort/snort.conf", "/etc/snort/snort.rules"):
+            if os.path.exists(p):
+                return p
+        return None
+
+    def find_log():
+        for p in ("/var/log/snort/alert_fast.txt", "/var/log/snort/alert", "/var/log/snort/alert.log"):
+            if os.path.exists(p):
+                return p
+        return "/var/log/snort/alert"
+
     def build(a):
         bin_path = which("snort")
         running = False
         if bin_path:
-            rc, out = sh("pgrep -f snort", timeout=2)
+            rc, _ = sh("pgrep -f snort", timeout=2)
             running = rc == 0
+        cfg = find_cfg()
         items = [
             Item("Binary", lambda a: None, value=lambda a: bin_path or "tidak ditemukan"),
             Item("Status", lambda a: None, value=lambda a: "berjalan" if running else "mati"),
+            Item("Config", lambda a: None, value=lambda a: cfg or "tidak ditemukan"),
         ]
-        if bin_path:
+        if bin_path and cfg:
             if running:
                 items.append(Item("Hentikan snort", lambda a: sh("pkill -f snort"), value=""))
             else:
-                items.append(Item("Jalankan snort", lambda a: sh("snort -A console -q -c /etc/snort/snort.conf -i eth0 &", timeout=3), value=""))
-            items.append(Item("Lihat log", lambda a: a.push(TextView("Snort log", (rd("/var/log/snort/alert") or "(kosong)").splitlines()[-50:])), value=""))
+                iface = app.hs.ap or app.hs.ap_iface() or "eth0"
+                cmd = "snort -c %s -i %s -A alert_fast -l /var/log/snort &" % (cfg, iface)
+                items.append(Item("Jalankan snort", lambda a: sh(cmd, timeout=3), value=""))
+            items.append(Item("Lihat log", lambda a: a.push(TextView("Snort log", (rd(find_log()) or "(kosong)").splitlines()[-50:])), value=""))
         return items
     return MenuScreen("Snort", build)
+
+
+def suricata_menu(app):
+    def find_cfg():
+        for p in ("/etc/suricata/suricata.yaml", "/etc/suricata/suricata.yml"):
+            if os.path.exists(p):
+                return p
+        return None
+
+    def find_log():
+        for p in ("/var/log/suricata/fast.log", "/var/log/suricata/eve.json", "/var/log/suricata/suricata.log"):
+            if os.path.exists(p):
+                return p
+        return "/var/log/suricata/fast.log"
+
+    def build(a):
+        bin_path = which("suricata")
+        running = False
+        if bin_path:
+            rc, _ = sh("pgrep -f suricata", timeout=2)
+            running = rc == 0
+        cfg = find_cfg()
+        items = [
+            Item("Binary", lambda a: None, value=lambda a: bin_path or "tidak ditemukan"),
+            Item("Status", lambda a: None, value=lambda a: "berjalan" if running else "mati"),
+            Item("Config", lambda a: None, value=lambda a: cfg or "tidak ditemukan"),
+        ]
+        if bin_path and cfg:
+            if running:
+                items.append(Item("Hentikan suricata", lambda a: sh("pkill -f suricata"), value=""))
+            else:
+                iface = app.hs.ap or app.hs.ap_iface() or "eth0"
+                cmd = "suricata -c %s -i %s -l /var/log/suricata -D" % (cfg, iface)
+                items.append(Item("Jalankan suricata", lambda a: sh(cmd, timeout=5), value=""))
+            items.append(Item("Lihat log", lambda a: a.push(TextView("Suricata log", (rd(find_log()) or "(kosong)").splitlines()[-50:])), value=""))
+        return items
+    return MenuScreen("Suricata", build)
+
+def lte_menu(app):
+    def lte_info():
+        rc, out = sh("mmcli -m 0", timeout=4)
+        if rc != 0:
+            return ["Modem tidak ditemukan"]
+        lines = []
+        for key in ("state:", "access tech:", "signal quality:", "power state:", "model:", "manufacturer:"):
+            for l in out.splitlines():
+                if key in l:
+                    lines.append(l.strip())
+        return lines or ["(tidak ada info)"]
+
+    def build(a):
+        items = [Item("LTE status", lambda a: a.push(TextView("LTE", lte_info())), value=lambda a: "info")]
+        return items
+    return MenuScreen("LTE", build)
+
+
+def gps_menu(app):
+    def gps_info():
+        rc, out = sh("gpspipe -w -n 1 2>/dev/null", timeout=3)
+        if rc != 0 or not out.strip():
+            rc2, out2 = sh("mmcli -m 0 --location-get", timeout=4)
+            if rc2 == 0:
+                return out2.splitlines()[:10] or ["(tidak ada data GPS)"]
+            return ["GPS tidak tersedia"]
+        return out.splitlines()[:10]
+
+    def build(a):
+        items = [Item("GPS", lambda a: a.push(TextView("GPS", gps_info())), value=lambda a: "info")]
+        return items
+    return MenuScreen("GPS", build)
+
+def dashboard_menu(app):
+    def is_running():
+        rc, _ = sh("pgrep -f dashboard_streamlit.py", timeout=2)
+        if rc == 0:
+            return True
+        rc, _ = sh("pgrep -f serve_dashboard.py", timeout=2)
+        if rc == 0:
+            return True
+        rc, _ = sh("pgrep -f app.py", timeout=2)
+        if rc == 0:
+            return True
+        return False
+
+    def build(a):
+        running = is_running()
+        items = [
+            Item("Status", lambda a: None, value=lambda a: "berjalan" if running else "mati"),
+            Item("Port", lambda a: None, value=lambda a: "7890"),
+        ]
+        if running:
+            items.append(Item("Hentikan dashboard", lambda a: (sh("pkill -f dashboard_streamlit.py"), sh("pkill -f serve_dashboard.py"), sh("pkill -f app.py")), value=""))
+        else:
+            items.append(Item("Jalankan Streamlit", lambda a: sh("nohup streamlit run /root/pocotui/dashboard_streamlit.py --server.port 7890 --server.address 0.0.0.0 >/dev/null 2>&1 &", timeout=3), value=""))
+        items.append(Item("URL", lambda a: None, value=lambda a: "http://<ip>:7890/"))
+        return items
+    return MenuScreen("Web Dashboard", build)
 
 def main_menu(app):
     def build(a):
@@ -1621,6 +1793,9 @@ def main_menu(app):
             Item("Tampilan & Daya", lambda a: a.push(display_menu(a))),
             Item("Log", lambda a: a.push(LogScreen())),
             Item("Snort", lambda a: a.push(snort_menu(a))),
+            Item("Suricata", lambda a: a.push(suricata_menu(a))),
+            Item("LTE", lambda a: a.push(lte_menu(a))),
+            Item("GPS", lambda a: a.push(gps_menu(a))),
             Item("Sistem", lambda a: a.push(system_menu(a))),
             Item("Bantuan / peta tombol", lambda a: a.push(TextView("Bantuan", HELP))),
             Item("Tutup menu", lambda a: a.pop()),
