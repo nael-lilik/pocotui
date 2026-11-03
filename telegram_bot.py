@@ -2,13 +2,13 @@
 """Nura Telegram bot — cyberpunk neon edition."""
 import json, urllib.request, time, os, threading, sys, subprocess
 
-TOKEN = "6272192596:AAFdeqNso0TZ-_uK1bWfVM4-JuGAgg7kXbo"
+TOKEN = ""
 HOTSPOT_CONF = "/root/pocotui/hotspot.conf"
-CHAT_ID = "141214455"
+CHAT_ID = ""
 OLLAMA_URL = "http://localhost:11434/api/generate"
-REMOTE_URL = "https://9r.nael.my.id/v1/chat/completions"
+REMOTE_URL = ""
 MODEL = "smart"
-API_KEY = "sk-40f412ec220cd00c-7u1eh5-8e3fb54a"
+API_KEY = ""
 OFFSET = 0
 
 NEON = "⚡"
