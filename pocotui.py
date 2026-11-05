@@ -51,7 +51,8 @@ MAC_RE = re.compile(r"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$")
 
 RUN = "/run/pocotui"                   # diatur ulang di main()
 UPSTREAM_TABLE = "202"
-UPSTREAM_RULE_PRIORITY = "14200"
+UPSTREAM_RULE_PRIORITY = "100"
+LEGACY_UPSTREAM_RULE_PRIORITIES = ("14200",)
 ENV_FILES = (
     os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
     "/etc/pocotui/.env",
@@ -96,6 +97,67 @@ def load_project_env():
 
 load_project_env()
 APN = os.environ.get("APN", "")
+GPS_ENABLED_VALUE = os.environ.get("GPS_ENABLED", "1").strip().lower()
+if GPS_ENABLED_VALUE not in ("1", "true", "yes", "on", "0", "false", "no", "off"):
+    raise ValueError("GPS_ENABLED harus berupa true/false atau 1/0")
+GPS_ENABLED = GPS_ENABLED_VALUE in ("1", "true", "yes", "on")
+GPS_MODEM = os.environ.get("GPS_MODEM", "0").strip()
+if not re.fullmatch(r"\d+", GPS_MODEM):
+    raise ValueError("GPS_MODEM harus berupa indeks modem numerik")
+GPS_ENABLE_LOCK = threading.Lock()
+
+
+def enable_modem_gps(app):
+    with GPS_ENABLE_LOCK:
+        if getattr(app, "_gps_enabled_modem", None) == GPS_MODEM:
+            return True, ""
+        errors = []
+        enabled = False
+        for source in ("gps-nmea", "gps-raw"):
+            rc, output = sh(["mmcli", "-m", GPS_MODEM, "--location-enable-" + source], timeout=4)
+            if rc:
+                errors.append(output or "ModemManager menolak sumber %s" % source)
+            else:
+                enabled = True
+        if not enabled:
+            return False, "; ".join(errors)
+        app._gps_enabled_modem = GPS_MODEM
+        return True, ""
+
+
+def request_cached_data(app, cache_name, fetch, max_age=5):
+    cache = getattr(app, cache_name, None)
+    if cache is None or time.monotonic() - cache[0] >= max_age:
+        fetching_name = cache_name + "_fetching"
+        if not getattr(app, fetching_name, False):
+            setattr(app, fetching_name, True)
+
+            def update():
+                try:
+                    result = fetch()
+                except Exception as error:
+                    result = (1, str(error))
+                setattr(app, cache_name, (time.monotonic(),) + result)
+                setattr(app, fetching_name, False)
+
+            threading.Thread(target=update, daemon=True, name=cache_name.lstrip("_")).start()
+    return getattr(app, cache_name, None)
+
+
+def fetch_modem_gps(app):
+    enabled, error = enable_modem_gps(app)
+    if not enabled:
+        return 1, "Gagal mengaktifkan GPS: %s" % error
+    return sh(["mmcli", "-m", GPS_MODEM, "--location-get"], timeout=4)
+
+
+def fetch_gps_menu(app):
+    rc, output = sh(["gpspipe", "-w", "-n", "1"], timeout=3) if which("gpspipe") else (127, "")
+    return (rc, output) if rc == 0 and output.strip() else fetch_modem_gps(app)
+
+
+def fetch_lte_data():
+    return sh(["mmcli", "-m", "0"], timeout=4)
 
 
 # ----------------------------------------------------------------------------
@@ -534,11 +596,13 @@ class Hotspot:
         if rc:
             return False, "route subnet: %s" % out[-100:]
 
-        rule = ["ip", "-4", "rule", "del", "from", subnet, "table", UPSTREAM_TABLE,
-                "priority", UPSTREAM_RULE_PRIORITY]
-        sh(rule, timeout=3)
         if not upstream:
-            sh(["ip", "-4", "route", "del", "default", "table", UPSTREAM_TABLE], timeout=3)
+            for priority in (UPSTREAM_RULE_PRIORITY,) + LEGACY_UPSTREAM_RULE_PRIORITIES:
+                sh(["ip", "-4", "rule", "del", "from", subnet, "table", UPSTREAM_TABLE,
+                    "priority", priority], timeout=3)
+            rc, out = sh(["ip", "-4", "route", "del", "default", "table", UPSTREAM_TABLE], timeout=3)
+            if rc and "No such process" not in out:
+                return False, "route default: %s" % out[-100:]
             return True, ""
 
         _, route_out = sh(["ip", "-4", "route", "show", "default", "dev", upstream, "table", "all"], timeout=3)
@@ -553,10 +617,29 @@ class Hotspot:
         rc, out = sh(default_args, timeout=3)
         if rc:
             return False, "route upstream %s: %s" % (upstream, out[-100:])
-        rc, out = sh(["ip", "-4", "rule", "add", "priority", UPSTREAM_RULE_PRIORITY,
-                      "from", subnet, "table", UPSTREAM_TABLE], timeout=3)
+        for priority in LEGACY_UPSTREAM_RULE_PRIORITIES:
+            sh(["ip", "-4", "rule", "del", "from", subnet, "table", UPSTREAM_TABLE,
+                "priority", priority], timeout=3)
+        rc, rules = sh(["ip", "-4", "rule", "show"], timeout=3)
         if rc:
-            return False, "policy rule: %s" % out[-100:]
+            return False, "gagal membaca policy rules: %s" % rules[-100:]
+        priority_in_use = any(
+            re.match(r"^\s*%s:\s+" % re.escape(UPSTREAM_RULE_PRIORITY), line)
+            and not (re.search(r"\bfrom\s+%s\b" % re.escape(subnet), line)
+                     and re.search(r"\b(?:lookup|table)\s+%s\b" % re.escape(UPSTREAM_TABLE), line))
+            for line in rules.splitlines())
+        if priority_in_use:
+            return False, "prioritas ip rule %s sudah dipakai; pilih prioritas lain" % UPSTREAM_RULE_PRIORITY
+        already_present = any(
+            re.match(r"^\s*%s:\s+" % re.escape(UPSTREAM_RULE_PRIORITY), line)
+            and re.search(r"\bfrom\s+%s\b" % re.escape(subnet), line)
+            and re.search(r"\b(?:lookup|table)\s+%s\b" % re.escape(UPSTREAM_TABLE), line)
+            for line in rules.splitlines())
+        if not already_present:
+            rc, out = sh(["ip", "-4", "rule", "add", "priority", UPSTREAM_RULE_PRIORITY,
+                          "from", subnet, "table", UPSTREAM_TABLE], timeout=3)
+            if rc:
+                return False, "policy rule: %s" % out[-100:]
         return True, ""
 
     def avoid_upstream_overlap(self, ap):
@@ -591,8 +674,9 @@ class Hotspot:
 
     def clear_client_route(self, ap):
         subnet = str(self.net())
-        sh(["ip", "-4", "rule", "del", "from", subnet, "table", UPSTREAM_TABLE,
-            "priority", UPSTREAM_RULE_PRIORITY], timeout=3)
+        for priority in (UPSTREAM_RULE_PRIORITY,) + LEGACY_UPSTREAM_RULE_PRIORITIES:
+            sh(["ip", "-4", "rule", "del", "from", subnet, "table", UPSTREAM_TABLE,
+                "priority", priority], timeout=3)
         sh(["ip", "-4", "route", "flush", "table", UPSTREAM_TABLE], timeout=3)
 
     def net(self):
@@ -658,7 +742,67 @@ class Hotspot:
     def fw_apply(self, ap, up):
         net = str(self.net())
         nat = self.cfg["nat"]
-        if which("iptables"):
+        if which("nft"):
+            out_if = 'oifname "%s"' % up if up else 'oifname != "%s"' % ap
+            script = ["table ip pocotui {",
+                      " chain postrouting { type nat hook postrouting priority srcnat; policy accept;"]
+            if nat:
+                script.append('  ip saddr %s %s counter masquerade comment "pocotui"' % (net, out_if))
+            script += [" }", "}"]
+            rc, output = sh(["nft", "-f", "-"], inp="\n".join(script) + "\n")
+            if rc:
+                raise RuntimeError("nft NAT: %s" % output[-120:])
+
+            if nat:
+                forward_rules = [
+                    ["iifname", ap, "oifname", up, "counter", "accept", "comment", "pocotui"]
+                    if up else
+                    ["iifname", ap, "oifname", "!=", ap, "counter", "accept", "comment", "pocotui"],
+                    (["iifname", up] if up else ["iifname", "!=", ap])
+                    + ["oifname", ap, "ct", "state", "established,related",
+                       "counter", "accept", "comment", "pocotui"],
+                ]
+            else:
+                forward_rules = [["iifname", ap, "counter", "drop", "comment", "pocotui"]]
+            integration_rules = [
+                ["nft", "insert", "rule", "inet", "filter", "input",
+                 "iifname", ap, "counter", "accept", "comment", "pocotui"],
+            ] + [
+                ["nft", "insert", "rule", "inet", "filter", "forward"] + rule
+                for rule in forward_rules
+            ]
+            for command in integration_rules:
+                rc, output = sh(command)
+                if rc:
+                    raise RuntimeError(
+                        "nft filter integration gagal (%s): %s" % (" ".join(command[-5:]), output[-120:]))
+            nat_rc, nat_rules = sh(["nft", "-a", "list", "table", "ip", "pocotui"])
+            input_rc, input_rules = sh(["nft", "-a", "list", "chain", "inet", "filter", "input"])
+            forward_rc, forward_output = sh(["nft", "-a", "list", "chain", "inet", "filter", "forward"])
+            if nat_rc or input_rc or forward_rc:
+                raise RuntimeError("gagal membaca ulang ruleset nft setelah instalasi")
+
+            def has_rule(rules, *parts):
+                return any('comment "pocotui"' in line and all(part in line for part in parts)
+                           for line in rules.splitlines())
+
+            nat_oif = 'oifname "%s"' % up if up else 'oifname != "%s"' % ap
+            expected_nat = has_rule(nat_rules, "ip saddr %s" % net, nat_oif, "masquerade")
+            if bool(nat) != expected_nat:
+                raise RuntimeError("verifikasi nft NAT gagal (subnet/interface masquerade tidak cocok)")
+            if not has_rule(input_rules, 'iifname "%s"' % ap, "accept"):
+                raise RuntimeError("verifikasi nft input gagal (akses klien hotspot ke perangkat)")
+            if nat:
+                out_match = 'oifname "%s"' % up if up else 'oifname != "%s"' % ap
+                in_match = 'iifname "%s"' % up if up else 'iifname != "%s"' % ap
+                if not has_rule(forward_output, 'iifname "%s"' % ap, out_match, "accept"):
+                    raise RuntimeError("verifikasi nft forward gagal (jalur upstream keluar)")
+                if not has_rule(forward_output, in_match, 'oifname "%s"' % ap,
+                                "ct state established,related", "accept"):
+                    raise RuntimeError("verifikasi nft forward gagal (paket balasan)")
+            elif not has_rule(forward_output, 'iifname "%s"' % ap, "drop"):
+                raise RuntimeError("verifikasi nft gagal: forwarding masih diizinkan saat NAT mati")
+        elif which("iptables"):
             o = "-o %s" % up if up else "! -o %s" % ap
             i = "-i %s" % up if up else "! -i %s" % ap
             cmds = [
@@ -682,41 +826,6 @@ class Hotspot:
                 rc, out = sh(c)
                 if rc != 0:
                     raise RuntimeError("iptables: %s" % out[-100:])
-        elif which("nft"):
-            oif = 'oifname "%s"' % up if up else 'oifname != "%s"' % ap
-            iif = 'iifname "%s"' % up if up else 'iifname != "%s"' % ap
-            script = ["table ip pocotui {",
-                      " chain input { type filter hook input priority -1; policy accept;",
-                      "  ct state established,related accept",
-                      '  iifname "%s" udp dport { 53, 67, 68 } accept' % ap,
-                      '  iifname "%s" tcp dport 53 accept }' % ap,
-                      " chain forward { type filter hook forward priority -1; policy accept;"]
-            if nat:
-                script += ['  iifname "%s" %s accept' % (ap, oif),
-                           "  %s oifname \"%s\" ct state established,related accept" % (iif, ap)]
-            script += [" }",
-                       " chain post { type nat hook postrouting priority 100; policy accept;"]
-            if nat:
-                script += ["  ip saddr %s %s masquerade" % (net, oif)]
-            script += [" }", "}"]
-            rc, out = sh("nft -f -", inp="\n".join(script) + "\n")
-            if rc != 0:
-                raise RuntimeError("nft: %s" % out[-100:])
-            # Sistem modern (postmarketOS/Alpine) memakai nftables inet filter
-            # dengan policy drop pada chain forward/input. Tabel pocotui terpisah
-            # tidak cukup: aturan accept harus masuk ke tabel inet filter agar
-            # trafik dari/ke AP (ap0) tidak di-drop. (bug: klien dapat IP tapi
-            # tidak ada internet, termasuk dengan IP statis)
-            for cmd in (["nft", "insert", "rule", "inet", "filter", "input",
-                         "iifname", ap, "comment", "pocotui", "accept"],
-                        ["nft", "insert", "rule", "inet", "filter", "forward",
-                         "iifname", ap, "comment", "pocotui", "accept"],
-                        ["nft", "insert", "rule", "inet", "filter", "forward",
-                         "oifname", ap, "ct", "state", "established,related",
-                         "comment", "pocotui", "accept"]):
-                rc, out = sh(cmd)
-                if rc:
-                    app.log("PERINGATAN: aturan nftables integrasi gagal: %s" % out[-100:])
         else:
             raise RuntimeError("iptables / nftables belum terpasang")
 
@@ -730,14 +839,10 @@ class Hotspot:
                 sh(c)
         if which("nft"):
             if ap:
-                for chain, patterns in (
-                    ("input", (r'iifname "%s" accept' % re.escape(ap),)),
-                    ("forward", (r'iifname "%s" accept' % re.escape(ap),
-                                 r'oifname "%s" ct state established,related accept' % re.escape(ap))),
-                ):
+                for chain in ("input", "forward"):
                     _, output = sh(["nft", "-a", "list", "chain", "inet", "filter", chain])
                     for line in output.splitlines():
-                        if 'comment "pocotui"' not in line and not any(re.search(p, line) for p in patterns):
+                        if 'comment "pocotui"' not in line:
                             continue
                         handle = re.search(r"# handle (\d+)", line)
                         if handle:
@@ -1655,21 +1760,17 @@ class DashScreen:
         c = app.c
         dim = c["dim"]
         rows = []
-        now = time.time()
-        cache = getattr(app, "_lte_cache", None)
-        if cache is None or now - cache[0] > 5:
-            rc, out = sh("mmcli -m 0", timeout=3)
-            rc2, out2 = sh("mmcli -m 0", timeout=4)
-            rc3, out3 = sh("mmcli -m 0 --command='AT+GSN' 2>&1", timeout=5)
-            app._lte_cache = (now, rc, out, rc2, out2, rc3, out3)
-        _, rc, out, rc2, out2, rc3, out3 = app._lte_cache
+        cache = request_cached_data(app, "_lte_cache", fetch_lte_data)
+        if cache is None:
+            return [[("Modem    ", dim), ("membaca status...", dim)]]
+        _, rc, out = cache
         if rc == 0:
             for key in ("state:", "access tech:", "signal quality:", "power state:", "manufacturer:", "model:"):
                 for l in out.splitlines():
                     if key in l:
                         rows.append([(key.replace(":", "").ljust(9), dim), (l.split(":", 1)[-1].strip(), c["wh"])])
             # operator name dari mmcli 3GPP (cached)
-            for l in (out2 or "").splitlines():
+            for l in out.splitlines():
                 if "operator name" in l.lower():
                     rows.append([("Operator ", dim), (l.split(":", 1)[-1].strip(), c["acc"])])
                 elif "operator id" in l.lower():
@@ -1678,32 +1779,23 @@ class DashScreen:
                     rows.append([("Reg      ", dim), (l.split(":", 1)[-1].strip(), c["acc"])])
                 elif "packet service state" in l.lower():
                     rows.append([("Pkt state", dim), (l.split(":", 1)[-1].strip(), c["dim"])])
-            # imei (cached)
-            if rc3 == 0 and out3:
-                import re
-                m = re.findall(r'\d{15}', out3)
-                if m:
-                    rows.append([("IMEI     ", dim), (m[0], c["wh"])])
-            else:
-                # from equipment id
-                for l in out.splitlines():
-                    if "equipment id" in l.lower():
-                        rows.append([("IMEI     ", dim), (l.split(":", 1)[-1].strip(), c["wh"])])
+            for l in out.splitlines():
+                if "equipment id" in l.lower():
+                    rows.append([("IMEI     ", dim), (l.split(":", 1)[-1].strip(), c["wh"])])
         else:
-            rows.append([("Modem    ", dim), ("tidak ditemukan", c["bad"])])
+            message = (out.splitlines() or ["tidak ditemukan"])[0]
+            rows.append([("Modem    ", dim), (message[:max(1, inner - 10)], c["bad"])])
         return rows or [[("Modem    ", dim), ("n/a", c["dim"])]]
 
     def rows_gps(self, app, d, inner):
         c = app.c
         dim = c["dim"]
+        if not GPS_ENABLED:
+            return [[("GPS      ", dim), ("dinonaktifkan (.env)", dim)]]
         rows = []
-        now = time.time()
-        cache = getattr(app, "_gps_cache", None)
-        if cache is None or now - cache[0] > 5:
-            sh("mmcli -m 0 --location-enable-gps-nmea 2>/dev/null", timeout=3)
-            sh("mmcli -m 0 --location-enable-gps-raw 2>/dev/null", timeout=3)
-            rc2, out2 = sh("mmcli -m 0 --location-get", timeout=4)
-            app._gps_cache = (now, rc2, out2)
+        cache = request_cached_data(app, "_gps_cache", lambda: fetch_modem_gps(app))
+        if cache is None:
+            return [[("GPS      ", dim), ("mengambil data...", dim)]]
         _, rc2, out2 = app._gps_cache
         lat = lon = alt = sats = hdop = fix = speed = None
         if rc2 == 0:
@@ -1726,14 +1818,14 @@ class DashScreen:
                         sats = parts[7]
                         hdop = parts[8]
                         alt = parts[9]
-                    except Exception:
+                    except (ValueError, IndexError, TypeError):
                         pass
                 if "RMC" in l:
                     parts = l.split(",")
                     try:
                         if parts[7]:
                             speed = float(parts[7]) * 1.852  # knots -> km/h
-                    except Exception:
+                    except (ValueError, IndexError, TypeError):
                         pass
         if lat is not None and lon is not None:
             rows.append([("Lat      ", dim), ("%.6f" % lat, c["wh"])])
@@ -1751,7 +1843,11 @@ class DashScreen:
                     rows.append([("Akurasi  ", dim), ("~%.0f m" % acc, c["wh"])])
             except Exception:
                 pass
-            rows.append([("Mode     ", dim), ("3D" if (fix in ("1","2","3","4","5","6") and float(alt or 0) != 0) else "2D", c["wh"])])
+            try:
+                has_altitude = float(alt or 0) != 0
+            except (TypeError, ValueError):
+                has_altitude = False
+            rows.append([("Mode     ", dim), ("3D" if fix in ("1","2","3","4","5","6") and has_altitude else "2D", c["wh"])])
         else:
             # fallback: tampilkan raw
             if rc2 == 0:
@@ -1759,7 +1855,7 @@ class DashScreen:
                     if l.strip() and not l.strip().startswith("-"):
                         rows.append([("GPS      ", dim), (l.strip()[:inner - 10], c["wh"])])
             else:
-                rows.append([("GPS      ", dim), ("tidak tersedia", c["dim"])])
+                rows.append([("GPS      ", dim), ((out2 or "tidak tersedia")[:inner - 10], c["warn"])])
         return rows or [[("GPS      ", dim), ("n/a", c["dim"])]]
 
     # -- tab: klien ----------------------------------------------------------------
@@ -2360,10 +2456,13 @@ def suricata_menu(app):
     return MenuScreen("Suricata", build)
 
 def lte_menu(app):
-    def lte_info():
-        rc, out = sh("mmcli -m 0", timeout=4)
+    def lte_info(a):
+        cache = request_cached_data(a, "_lte_cache", fetch_lte_data)
+        if cache is None:
+            return ["Membaca status modem..."]
+        _, rc, out = cache
         if rc != 0:
-            return ["Modem tidak ditemukan"]
+            return ["Status modem gagal:", out] if out else ["Modem tidak ditemukan"]
         lines = []
         for key in ("state:", "access tech:", "signal quality:", "power state:", "model:", "manufacturer:"):
             for l in out.splitlines():
@@ -2372,23 +2471,25 @@ def lte_menu(app):
         return lines or ["(tidak ada info)"]
 
     def build(a):
-        items = [Item("LTE status", lambda a: a.push(TextView("LTE", lte_info())), value=lambda a: "info")]
+        items = [Item("LTE status", lambda a: a.push(TextView("LTE", lte_info)), value=lambda a: "info")]
         return items
     return MenuScreen("LTE", build)
 
 
 def gps_menu(app):
-    def gps_info():
-        rc, out = sh("gpspipe -w -n 1 2>/dev/null", timeout=3)
-        if rc != 0 or not out.strip():
-            rc2, out2 = sh("mmcli -m 0 --location-get", timeout=4)
-            if rc2 == 0:
-                return out2.splitlines()[:10] or ["(tidak ada data GPS)"]
-            return ["GPS tidak tersedia"]
-        return out.splitlines()[:10]
+    def gps_info(a):
+        if not GPS_ENABLED:
+            return ["GPS dinonaktifkan oleh GPS_ENABLED di .env"]
+        cache = request_cached_data(a, "_gps_menu_cache", lambda: fetch_gps_menu(a))
+        if cache is None:
+            return ["Mengambil data GPS..."]
+        _, rc, output = cache
+        if rc == 0:
+            return output.splitlines()[:10] or ["(tidak ada data GPS)"]
+        return ["GPS tidak tersedia", output] if output else ["GPS tidak tersedia"]
 
     def build(a):
-        items = [Item("GPS", lambda a: a.push(TextView("GPS", gps_info())), value=lambda a: "info")]
+        items = [Item("GPS", lambda a: a.push(TextView("GPS", gps_info)), value=lambda a: "info")]
         return items
     return MenuScreen("GPS", build)
 

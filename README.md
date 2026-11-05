@@ -17,6 +17,12 @@ model LLM; sesuaikan dengan layanan yang digunakan.
 memasukkan APN secara manual saat wizard berjalan. POCO-TUI membaca `.env` di direktori
 proyek, atau `/etc/pocotui/.env` untuk pemasangan sistem. Variabel `POCOTUI_ENV_FILE`
 dapat digunakan untuk menentukan lokasi file lain.
+`GPS_ENABLED=1` mengaktifkan pembacaan GPS ModemManager (default untuk menjaga perilaku lama);
+atur `GPS_ENABLED=0` untuk mencegah TUI mengaktifkan atau membaca data lokasi. Opsi ini tidak
+mematikan GNSS secara global jika sebelumnya sudah diaktifkan atau dipakai layanan lain.
+Aktivasi sumber GPS dilakukan sekali per modem selama proses TUI berjalan. `GPS_MODEM=0`
+memilih indeks modem yang dipakai, dan dapat disesuaikan jika indeks GPS ModemManager perangkat berbeda.
+Pembacaan modem/GPS pada panel berjalan di latar belakang agar TUI tetap responsif saat ModemManager lambat.
 Jalankan bot dari direktori proyek; `.env` dibaca otomatis dan tidak dilacak Git.
 Batasi akses file dengan `chmod 600 .env`. Jangan membagikan atau meng-commit file ini.
 Jika token atau API key pernah tersimpan di Git, cabut/rotasi kredensial tersebut;
@@ -82,11 +88,21 @@ Perubahan pengaturan radio berlaku setelah *Restart hotspot* (ada pengingat di l
    Mode lama (AP langsung di interface Wi-Fi induk) masih ada: Menu > Pengaturan > Hotspot/Wi-Fi > Mode AP.
 2. `hostapd` membuat AP di `ap0` (WPA2-PSK CCMP, atau terbuka bila sandi kosong).
 3. `dnsmasq` memberi DHCP (`.10–.110`) dan DNS (upstream: Cloudflare/Google/Quad9/AdGuard — pilih di menu).
-4. `ip_forward=1` + aturan NAT di chain/tabel khusus `POCOTUI` / `pocotui` (mudah dibersihkan, tidak
-   menyentuh aturan firewall lain). Dipakai `iptables` bila ada, jika tidak `nft`.
-5. Trafik dari subnet klien memakai policy routing tabel khusus `202`, dipilih otomatis oleh monitor upstream
-   (Wi-Fi > LTE > rute lain). Saat hotspot dimatikan tabel/rule itu dibersihkan dan `ip_forward` dikembalikan.
-   Dalam mode virtual interface Wi-Fi induk tetap tersambung seperti semula.
+4. `ip_forward=1` dan firewall **nftables diprioritaskan** (iptables hanya fallback bila `nft` tidak ada).
+   Tabel POCO-TUI hanya memuat NAT `postrouting`: masquerade dibatasi ke subnet hotspot dan interface egress
+   yang dipilih; mode auto memakai semua interface selain AP agar NAT tetap berlaku saat failover. Aturan
+   filter bertanda `comment "pocotui"` ditambahkan ke chain `inet filter` yang ada; hanya aturan bertanda
+   tersebut yang dihapus saat stop, sehingga aturan lain dipertahankan. Akses input dari klien hotspot ke
+   perangkat diizinkan agar layanan/server lokal dapat dijangkau. Forward dibatasi ke upstream terpilih
+   (atau semua interface non-AP pada mode auto); bila NAT dimatikan, forwarding dari klien dijatuhkan.
+   Jika chain filter yang diperlukan tidak tersedia atau integrasi gagal, hotspot gagal start dengan error,
+   bukan melanjutkan dalam kondisi firewall yang tidak terverifikasi.
+5. Trafik dari subnet klien diarahkan memakai `ip rule` prioritas `100` ke tabel route khusus `202`, sebelum
+   rule policy seperti Tailscale yang dapat mengambil alih trafik klien; monitor memperbarui default route
+   tabel tersebut saat Wi-Fi/LTE failover. NAT dilakukan setelah keputusan routing pada hook `postrouting`.
+   Tidak ada rule POCO-TUI di `prerouting` atau `output`: tidak digunakan DNAT atau packet marking untuk routing.
+   Saat hotspot dimatikan hanya rule/rute POCO-TUI yang dihapus dan nilai `ip_forward` dikembalikan. Dalam
+   mode virtual interface, Wi-Fi induk tetap tersambung seperti semula.
 
 Upstream **auto** memprioritaskan interface Wi-Fi yang tersambung, memiliki default route, dan lolos probe internet
 periodik, lalu interface LTE aktif, lalu rute lain. Probe memakai ping ke `1.1.1.1` setiap 20 detik; jika
