@@ -74,11 +74,13 @@ Layout otomatis menyesuaikan: satu kolom (portrait HP) atau dua kolom (layar leb
 
 Menu utama diringkas menjadi `Hotspot` (nyala/mati/restart, kredensial, **QR WiFi**, info koneksi),
 `Klien` (kick, blokir, daftar blokir), `Jaringan` (upstream, NAT, DNS, subnet, tes ping, interface),
-`Pengaturan` (WiFi/AP: SSID, sandi, band/channel, negara, klien; tampilan/daya: kecerahan, timeout,
+`Pengaturan` (WiFi/AP: SSID, sandi, band/channel, negara, klien, kunci BSSID; tampilan/daya: kecerahan, timeout,
 tema, ASCII/Unicode, interval), `Monitoring & layanan` (Snort, Suricata, LTE, GPS, web dashboard),
 `Log`, `Sistem`, dan `Bantuan`. Tekan POWER tahan untuk kembali/menutup menu.
 
 Perubahan pengaturan radio berlaku setelah *Restart hotspot* (ada pengingat di layar).
+Menu `Sistem` juga mengatur AP idle (default 30 menit tanpa klien; dapat dinonaktifkan) dan
+shutdown baterai rendah (default aktif pada 15%).
 
 ## Cara kerja hotspot
 
@@ -114,7 +116,25 @@ tidak tersedia atau gagal probe, lalu dihentikan saat Wi-Fi pulih. Wi-Fi yang su
 juga bisa tersambung otomatis sesuai pengaturan profilnya.
 Wizard Wi-Fi menjeda AP terlebih dahulu (dengan konfirmasi), memindai SSID, menampilkan kekuatan sinyal dan
 keamanan, lalu menyimpan jaringan yang dipilih sebagai profil NetworkManager. Sandi disimpan oleh NetworkManager,
-bukan di konfigurasi POCO-TUI. Setelah tersambung, mode upstream otomatis diaktifkan.
+bukan di konfigurasi POCO-TUI. Pilihan **Smart** mempertahankan koneksi saat ini bila trafik sedang tinggi
+(≥128 KiB/s) atau sinyalnya masih dalam 15 poin dari sinyal terbaik; selain itu memilih sinyal terkuat.
+Pemilihan kandidat baru hanya dilakukan di wizard (yang memang menjeda AP), bukan diam-diam saat klien sedang
+menggunakan hotspot. Setelah tersambung, mode upstream otomatis diaktifkan. Opsi `Kunci BSSID upstream WiFi`
+aktif secara default: mengunci profil ke access point yang dipilih agar roaming ke channel lain tidak memicu
+perpindahan radio. Matikan opsi ini jika perlu roaming otomatis; kunci profil aktif juga dilepas saat opsi
+dimatikan.
+
+Saat upstream Wi-Fi berpindah channel ketika AP aktif, POCO-TUI **tidak me-restart AP otomatis** agar klien
+tidak diputus oleh aplikasi. Perubahan dicatat di Log; satu radio tetap membatasi kombinasi channel AP/STA dan
+dukungan mengikuti perilaku driver/firmware. Lock BSSID mengurangi roaming tak terduga, tetapi tidak dapat
+mencegah perubahan channel yang dilakukan access point itu sendiri.
+
+Shutdown baterai hanya berjalan pada perangkat nyata ketika sampel baterai masih baru, statusnya `Discharging`,
+dan kapasitas ≤15% tanpa charger terdeteksi. Kondisi harus bertahan 30 detik lalu memberi countdown 30 detik;
+charger terpasang atau kondisi baterai pulih membatalkan countdown. Hotspot idle dihitung hanya dari sampel
+hostapd yang valid dan segar; jika tidak ada klien selama 30 menit, AP dimatikan (perangkat tetap menyala).
+Kedua otomasi dapat diubah dari Menu > Sistem. Mode `--demo` tidak pernah menjalankan shutdown atau mematikan AP
+otomatis.
 
 Untuk aktivasi LTE otomatis, modem harus sudah dikenali NetworkManager/ModemManager, profil GSM dan APN valid,
 serta modem memiliki layanan data. Wizard dapat memilih profil GSM yang ada atau membuat profil baru dengan APN.
@@ -130,8 +150,7 @@ start pertama** — lihat/ubah di Menu. Jangan memakai sandi bawaan yang umum.
   `ap0` **dipaksa memakai channel/band yang sama** dengan `wlan0`. TUI mendeteksinya otomatis dan menampilkan
   "(ikut wlan0)" di panel Radio; pengaturan Band/Channel hanya berlaku saat interface induk tidak tersambung.
 - Wizard Wi-Fi akan meminta izin menjeda hotspot sebelum scan; klien terputus selama jeda. Bila upstream Wi-Fi
-  berpindah channel saat hotspot hidup, TUI me-restart AP agar kembali mengikuti frekuensi tersebut; klien
-  dapat terputus sebentar.
+  berpindah channel saat hotspot hidup, TUI hanya mencatat peringatan dan tidak me-restart AP otomatis.
 - Tergantung driver/firmware: jika `iw ... interface add` ditolak, hotspot gagal dengan pesan jelas;
   pilih Mode AP > "wlan0 langsung" sebagai cadangan (wlan0 akan terputus dari WiFi lain).
 - `wlan0` bisa jadi upstream (repeater): Menu > Jaringan > Interface upstream (auto mengikuti rute default).
