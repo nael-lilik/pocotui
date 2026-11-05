@@ -35,9 +35,9 @@ baterai, charging, suhu, upstream, status hotspot, serta jumlah klien. Data loka
 lokal/terproteksi, jangan mengekspos port Redis ke internet, dan atur retensi sesuai kebutuhan. Installer
 standar memasang dan mengaktifkan Redis lokal; `--no-packages` melewati pemasangan tersebut. Gangguan Redis
 tidak menghentikan TUI; peringatan dicatat di Log.
-Menu Monitoring & layanan > GPS > **Peta terminal (lintasan lokal)** menampilkan posisi dan sampai 500 titik
-track terakhir dari sesi saat ini pada grid; VOL+ memperbesar dan VOL− memperkecil. Ini peta jejak lokal,
-bukan peta jalan: tidak memakai tile, internet, atau layanan peta pihak ketiga.
+Tab **Peta** menampilkan posisi dan sampai 500 titik track terakhir dari sesi saat ini pada grid. Menu
+Monitoring & layanan > GPS > **Peta terminal (lintasan lokal)** juga menyediakan tampilan penuh dan zoom.
+Ini peta jejak lokal, bukan peta jalan: tidak memakai tile, internet, atau layanan peta pihak ketiga.
 Jalankan bot dari direktori proyek; `.env` dibaca otomatis dan tidak dilacak Git.
 Batasi akses file dengan `chmod 600 .env`. Jangan membagikan atau meng-commit file ini.
 Jika token atau API key pernah tersimpan di Git, cabut/rotasi kredensial tersebut;
@@ -92,9 +92,10 @@ Menu utama diringkas menjadi `Hotspot` (nyala/mati/restart, kredensial, **QR WiF
 `Pengaturan` (WiFi/AP: SSID, sandi, band/channel, negara, klien, kunci BSSID; tampilan/daya: kecerahan, timeout,
 tema, ASCII/Unicode, interval), `Monitoring & layanan` (Snort, Suricata, LTE, GPS, web dashboard),
 `Log`, `Sistem`, dan `Bantuan`. Tekan POWER tahan untuk kembali/menutup menu.
-Menu Monitoring & layanan > GPS menyediakan **Peta terminal**: posisi dan track GPS sesi berjalan
-digambar pada grid karakter dengan zoom. Peta bersifat lokal (tidak mengunduh peta jalan/tile dan tidak
-mengirim koordinat ke penyedia peta); VOL+ memperbesar, VOL− memperkecil.
+Dasbor memiliki tab **Peta** khusus; halaman Ringkasan juga menampilkan mini-map. Menu Monitoring & layanan
+> GPS menyediakan **Peta terminal** penuh dengan zoom (VOL+ memperbesar, VOL− memperkecil). Semua peta
+menampilkan posisi dan track GPS sesi berjalan pada grid karakter, bersifat lokal (tidak mengunduh peta
+jalan/tile dan tidak mengirim koordinat ke penyedia peta).
 
 Perubahan pengaturan radio berlaku setelah *Restart hotspot* (ada pengingat di layar).
 Menu `Sistem` juga mengatur AP idle (default 30 menit tanpa klien; dapat dinonaktifkan) dan

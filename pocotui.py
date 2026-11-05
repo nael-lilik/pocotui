@@ -1807,14 +1807,34 @@ class TerminalMapScreen:
         elif ev in ("ok", "back"):
             app.pop()
 
-    def draw(self, app):
+    def draw(self, app, dashboard=False):
         h, w = app.size()
-        app.header(" Peta GPS Lokal ", "VOL+/-: zoom ")
+        if not dashboard:
+            app.header(" Peta GPS Lokal ", "VOL+/-: zoom ")
         if not GPS_ENABLED:
             app.put(2, 2, "GPS dinonaktifkan oleh GPS_ENABLED di .env", app.c["warn"])
-            app.footer(self.hints)
+            if not dashboard:
+                app.footer(self.hints)
             return
 
+        points, current, recorder = self.get_points(app)
+        if not points:
+            status = recorder.state if recorder else "GPS tidak tersedia"
+            app.put(2, 2, "Belum ada posisi GPS valid.", app.c["warn"])
+            app.put(3, 2, status, app.c["dim"])
+            app.put(5, 2, "Peta ini menggambar lintasan lokal; tidak mengunduh tile peta.", app.c["dim"])
+            if not dashboard:
+                app.footer(self.hints)
+            return
+
+        map_y, map_x = 2, 1
+        map_h = max(3, h - app.top_margin - 6)
+        map_w = max(1, w - 2)
+        self.draw_map(app, points, current, recorder, map_x, map_y, map_w, map_h)
+        if not dashboard:
+            app.footer(self.hints)
+
+    def get_points(self, app):
         cache = request_cached_data(app, "_gps_cache", lambda: fetch_modem_gps(app))
         current = None
         if cache and cache[1] == 0:
@@ -1828,22 +1848,20 @@ class TerminalMapScreen:
             if not points or (points[-1]["latitude"], points[-1]["longitude"]) != (
                     current["latitude"], current["longitude"]):
                 points.append(current)
-        if not points:
-            status = recorder.state if recorder else "GPS tidak tersedia"
-            app.put(2, 2, "Belum ada posisi GPS valid.", app.c["warn"])
-            app.put(3, 2, status, app.c["dim"])
-            app.put(5, 2, "Peta ini menggambar lintasan lokal; tidak mengunduh tile peta.", app.c["dim"])
-            app.footer(self.hints)
+        return points, current, recorder
+
+    def draw_map(self, app, points, current, recorder, x, y, width, height, preview=False):
+        lines = terminal_track_map(points, width, height, self.zoom)
+        for row, text in enumerate(lines):
+            app.put(y + row, x, text, app.c["dim"])
+        if preview:
+            latest = points[-1]
+            location = "%0.4f,%0.4f" % (latest["latitude"], latest["longitude"])
+            app.put(y + height, x, "%d titik  @ %s" % (len(points), location), app.c["acc"])
             return
 
-        map_y, map_x = 2, 1
-        map_h = max(3, h - app.top_margin - 6)
-        map_w = max(1, w - 2)
-        lines = terminal_track_map(points, map_w, map_h, self.zoom)
-        for row, text in enumerate(lines):
-            app.put(map_y + row, map_x, text, app.c["dim"])
         latest = points[-1]
-        app.put(map_y + map_h, 1,
+        app.put(y + height, x,
                 "@ posisi terkini  . lintasan  N ^  |  %.6f, %.6f"
                 % (latest["latitude"], latest["longitude"]), app.c["acc_b"])
         fix_details = []
@@ -1855,20 +1873,20 @@ class TerminalMapScreen:
                 fix_details.append("%.1f km/j" % current["speed_kmh"])
         else:
             fix_details.append("GPS menunggu fix")
-        app.put(map_y + map_h + 1, 1,
+        app.put(y + height + 1, x,
                 "%d titik sesi  |  zoom %.1fx  |  %s  |  %s"
                 % (len(points), self.zoom, ", ".join(fix_details),
                    recorder.state if recorder else "GPS aktif"),
                 app.c["dim"])
-        app.footer(self.hints)
 
 
 class DashScreen:
-    TABS = ["Ringkasan", "Jaringan", "Klien", "Trafik", "Log"]
+    TABS = ["Ringkasan", "Jaringan", "Klien", "Trafik", "Peta", "Log"]
     hints = [("VOL+", "Tab kiri"), ("VOL-", "Tab kanan"), ("PWR", "Menu"), ("PWR tahan", "Hotspot")]
 
     def __init__(self):
         self.tab = 0
+        self.map_screen = TerminalMapScreen()
 
     def key(self, app, ev):
         if ev == "up":
@@ -1895,7 +1913,12 @@ class DashScreen:
                    "%s %s  %s%s " % (S["on"] if hs.state == "on" else S["off"], state, btxt, time.strftime("%H:%M")))
         app.tabbar(1, self.TABS, self.tab)
         y0, y1 = 2, h - 2
-        [self.ov, self.nw, self.cl, self.tr, self.lg][self.tab](app, d, y0, y1, w)
+        if self.tab == 4:
+            self.map_screen.draw(app, dashboard=True)
+            app.footer(self.hints)
+            return
+        screen_index = self.tab if self.tab < 4 else self.tab - 1
+        [self.ov, self.nw, self.cl, self.tr, self.lg][screen_index](app, d, y0, y1, w)
         app.footer(self.hints)
 
     # -- tab: ringkasan ------------------------------------------------------------
@@ -1913,17 +1936,37 @@ class DashScreen:
             y = y0
             for t, r in panels[:2]:
                 y += app.panel(y, 0, lw, t, r, (y1 - y0) // 2)
-            # right column: sistem then modem
+            # Right column keeps the home view compact and includes a map preview.
             half = (y1 - y0) // 2
             y2 = y0
             y2 += app.panel(y2, cw, w - cw, panels[2][0], panels[2][1], half)
-            app.panel(y2, cw, w - cw, panels[3][0], panels[3][1], y1 - y2)
+            self.map_preview(app, y2, cw, w - cw, y1 - y2)
         else:
             y = y0
-            for t, r in panels:
+            for t, r in panels[:2]:
                 if y1 - y < 3:
-                    break
-                y += app.panel(y, 0, w, t, r, (y1 - y0) // 4)
+                    return
+                y += app.panel(y, 0, w, t, r, max(3, (y1 - y0) // 4))
+            remaining = y1 - y
+            if remaining >= 5:
+                self.map_preview(app, y, 0, w, min(6, remaining))
+                y += min(6, remaining)
+            if y1 - y >= 3:
+                app.panel(y, 0, w, panels[2][0], panels[2][1], y1 - y)
+
+    def map_preview(self, app, y, x, width, height):
+        if height < 4 or width < 12:
+            return
+        screen = self.map_screen
+        points, current, recorder = screen.get_points(app)
+        app.box(y, x, height, width, "PETA GPS")
+        if not points:
+            app.put(y + 1, x + 2, "Menunggu fix GPS", app.c["dim"])
+            return
+        map_width = width - 4
+        map_height = min(3, height - 2)
+        screen.draw_map(app, points, current, recorder, x + 2, y + 1,
+                        map_width, map_height, preview=True)
 
     def rows_hotspot(self, app, d, inner):
         c, S, hs, cfg = app.c, app.sym, app.hs, app.cfg
