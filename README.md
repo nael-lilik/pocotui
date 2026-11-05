@@ -23,6 +23,21 @@ mematikan GNSS secara global jika sebelumnya sudah diaktifkan atau dipakai layan
 Aktivasi sumber GPS dilakukan sekali per modem selama proses TUI berjalan. `GPS_MODEM=0`
 memilih indeks modem yang dipakai, dan dapat disesuaikan jika indeks GPS ModemManager perangkat berbeda.
 Pembacaan modem/GPS pada panel berjalan di latar belakang agar TUI tetap responsif saat ModemManager lambat.
+Dengan `REDIS_URL=redis://127.0.0.1:6379/0`, POCO-TUI menyimpan seluruh respons mentah GPS dari ModemManager,
+termasuk data saat belum ada fix, ke Redis setiap
+`GPS_REDIS_INTERVAL` detik (default 60) dan menerapkan retensi `GPS_REDIS_RETENTION_DAYS` hari
+(default 30). URL `rediss://` untuk koneksi TLS dan kredensial URL (`redis://user:password@host:port/db`)
+didukung; kosongkan `REDIS_URL` untuk mematikan penyimpanan. Pastikan Redis telah dipasang dan berjalan
+lokal, atau tentukan endpoint privat tepercaya. Data disimpan sebagai Redis Stream `pocotui:location`
+(maksimum sekitar 50.000 record) serta key JSON `pocotui:location:latest`; tiap record menyimpan teks penuh
+respons `mmcli --location-get` pada `raw_gps_data`, modem sumber, hasil parsing jika fix valid, dan konteks
+baterai, charging, suhu, upstream, status hotspot, serta jumlah klien. Data lokasi sensitif: gunakan Redis
+lokal/terproteksi, jangan mengekspos port Redis ke internet, dan atur retensi sesuai kebutuhan. Installer
+standar memasang dan mengaktifkan Redis lokal; `--no-packages` melewati pemasangan tersebut. Gangguan Redis
+tidak menghentikan TUI; peringatan dicatat di Log.
+Menu Monitoring & layanan > GPS > **Peta terminal (lintasan lokal)** menampilkan posisi dan sampai 500 titik
+track terakhir dari sesi saat ini pada grid; VOL+ memperbesar dan VOL− memperkecil. Ini peta jejak lokal,
+bukan peta jalan: tidak memakai tile, internet, atau layanan peta pihak ketiga.
 Jalankan bot dari direktori proyek; `.env` dibaca otomatis dan tidak dilacak Git.
 Batasi akses file dengan `chmod 600 .env`. Jangan membagikan atau meng-commit file ini.
 Jika token atau API key pernah tersimpan di Git, cabut/rotasi kredensial tersebut;
@@ -77,6 +92,9 @@ Menu utama diringkas menjadi `Hotspot` (nyala/mati/restart, kredensial, **QR WiF
 `Pengaturan` (WiFi/AP: SSID, sandi, band/channel, negara, klien, kunci BSSID; tampilan/daya: kecerahan, timeout,
 tema, ASCII/Unicode, interval), `Monitoring & layanan` (Snort, Suricata, LTE, GPS, web dashboard),
 `Log`, `Sistem`, dan `Bantuan`. Tekan POWER tahan untuk kembali/menutup menu.
+Menu Monitoring & layanan > GPS menyediakan **Peta terminal**: posisi dan track GPS sesi berjalan
+digambar pada grid karakter dengan zoom. Peta bersifat lokal (tidak mengunduh peta jalan/tile dan tidak
+mengirim koordinat ke penyedia peta); VOL+ memperbesar, VOL− memperkecil.
 
 Perubahan pengaturan radio berlaku setelah *Restart hotspot* (ada pengingat di layar).
 Menu `Sistem` juga mengatur AP idle (default 30 menit tanpa klien; dapat dinonaktifkan) dan

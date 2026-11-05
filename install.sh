@@ -46,17 +46,20 @@ fi
 if [ "$PACKAGES" = 1 ]; then
   echo "[1/3] Memasang paket"
   if command -v apk >/dev/null 2>&1; then
-    for p in python3 hostapd dnsmasq iptables iproute2 iw rfkill libqrencode-tools \
+    for p in python3 hostapd dnsmasq iptables iproute2 iw rfkill redis libqrencode-tools \
              ncurses-terminfo-base kbd terminus-font; do
       apk add --no-cache "$p" >/dev/null 2>&1 && echo "    + $p" || echo "    ! lewati $p (tidak ada/gagal)"
     done
+    rc-service redis start >/dev/null 2>&1 || true
+    rc-update add redis default >/dev/null 2>&1 || true
     # layanan bawaan jangan ikut jalan sendiri (rebutan port 53 / wlan0)
     for s in dnsmasq hostapd; do rc-service "$s" stop >/dev/null 2>&1 || true; rc-update del "$s" >/dev/null 2>&1 || true; done
   elif command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 hostapd dnsmasq iptables iproute2 iw rfkill qrencode kbd fonts-terminus
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 hostapd dnsmasq iptables iproute2 iw rfkill redis-server qrencode kbd fonts-terminus
     systemctl unmask hostapd 2>/dev/null || true
     systemctl disable --now hostapd dnsmasq 2>/dev/null || true
+    systemctl enable --now redis-server
   else
     echo "    Manajer paket tidak dikenal. Pasang manual: python3 hostapd dnsmasq iptables(atau nftables) iproute2 [qrencode]"
   fi

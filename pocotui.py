@@ -34,12 +34,15 @@ import select
 import shlex
 import shutil
 import signal
+import socket
+import ssl
 import string
 import struct
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 
 VERSION = "1.0"
 LONG_PRESS = 0.7                       # detik, POWER ditahan = "kembali"
@@ -104,7 +107,192 @@ GPS_ENABLED = GPS_ENABLED_VALUE in ("1", "true", "yes", "on")
 GPS_MODEM = os.environ.get("GPS_MODEM", "0").strip()
 if not re.fullmatch(r"\d+", GPS_MODEM):
     raise ValueError("GPS_MODEM harus berupa indeks modem numerik")
+REDIS_URL = os.environ.get("REDIS_URL", "redis://127.0.0.1:6379/0").strip()
+try:
+    GPS_REDIS_INTERVAL = int(os.environ.get("GPS_REDIS_INTERVAL", "60"))
+    GPS_REDIS_RETENTION_DAYS = int(os.environ.get("GPS_REDIS_RETENTION_DAYS", "30"))
+except ValueError as error:
+    raise ValueError("GPS_REDIS_INTERVAL dan GPS_REDIS_RETENTION_DAYS harus berupa angka") from error
+if GPS_REDIS_INTERVAL < 5 or GPS_REDIS_RETENTION_DAYS < 1:
+    raise ValueError("GPS_REDIS_INTERVAL minimal 5 detik dan retensi minimal 1 hari")
 GPS_ENABLE_LOCK = threading.Lock()
+
+
+def parse_nmea_coordinate(value, hemisphere, degree_digits):
+    if not value or hemisphere not in ("N", "S", "E", "W"):
+        return None
+    try:
+        raw = float(value)
+        degrees = int(raw // 100)
+        minutes = raw - degrees * 100
+        if minutes >= 60:
+            return None
+        result = degrees + minutes / 60.0
+        limit = 90 if degree_digits == 2 else 180
+        if result > limit or (result == limit and minutes != 0):
+            return None
+        return -result if hemisphere in ("S", "W") else result
+    except (ValueError, TypeError):
+        return None
+
+
+def parse_gps_nmea(output):
+    fix = {"latitude": None, "longitude": None, "altitude_m": None,
+           "speed_kmh": None, "satellites": None, "hdop": None, "fix": 0}
+    for line in (output or "").splitlines():
+        line = line.strip()
+        if not line.startswith("$") and "$" in line:
+            line = line[line.index("$"):]
+        if not line.startswith("$") or "*" in line and not re.search(r"\*[0-9A-Fa-f]{2}$", line):
+            continue
+        fields = line.split("*", 1)[0].split(",")
+        kind = fields[0][-3:]
+        if kind == "GGA" and len(fields) >= 10:
+            try:
+                fix["fix"] = int(fields[6] or 0)
+                fix["satellites"] = int(fields[7]) if fields[7] else None
+                fix["hdop"] = float(fields[8]) if fields[8] else None
+                fix["altitude_m"] = float(fields[9]) if fields[9] else None
+            except ValueError:
+                continue
+            fix["latitude"] = parse_nmea_coordinate(fields[2], fields[3], 2)
+            fix["longitude"] = parse_nmea_coordinate(fields[4], fields[5], 3)
+        elif kind == "RMC" and len(fields) >= 8:
+            if fields[2] == "A":
+                fix["latitude"] = parse_nmea_coordinate(fields[3], fields[4], 2)
+                fix["longitude"] = parse_nmea_coordinate(fields[5], fields[6], 3)
+            try:
+                fix["speed_kmh"] = float(fields[7]) * 1.852 if fields[7] else None
+            except ValueError:
+                pass
+    if fix["fix"] <= 0 or fix["latitude"] is None or fix["longitude"] is None:
+        return None
+    return fix
+
+
+def terminal_track_map(points, width, height, zoom=1.0):
+    width, height = max(1, width), max(1, height)
+    grid = [[" " for _ in range(width)] for _ in range(height)]
+    if not points:
+        return ["".join(row) for row in grid]
+    reference_lat, reference_lon = points[-1]["latitude"], points[-1]["longitude"]
+    longitude_scale = max(0.01, math.cos(math.radians(reference_lat)))
+    projected = [
+        (((point["longitude"] - reference_lon + 180) % 360 - 180) * 111320 * longitude_scale,
+         (point["latitude"] - reference_lat) * 111320)
+        for point in points
+    ]
+    half_width = max(1, (width - 1) / 2.0)
+    half_height = max(1, (height - 1) / 4.0)
+    scale = max(
+        max((abs(east) for east, _ in projected), default=0) / half_width,
+        max((abs(north) for _, north in projected), default=0) / half_height,
+        1.0,
+    ) / max(0.25, min(8.0, zoom))
+    center_x, center_y = (width - 1) / 2.0, (height - 1) / 2.0
+    coords = [
+        (int(round(center_x + east / scale)),
+         int(round(center_y - north / (scale * 2))))
+        for east, north in projected
+    ]
+
+    def line(x0, y0, x1, y1):
+        dx, dy = abs(x1 - x0), -abs(y1 - y0)
+        sx, sy = (1 if x0 < x1 else -1), (1 if y0 < y1 else -1)
+        error = dx + dy
+        while True:
+            if 0 <= x0 < width and 0 <= y0 < height:
+                grid[y0][x0] = "+"
+            if x0 == x1 and y0 == y1:
+                break
+            doubled = 2 * error
+            if doubled >= dy:
+                error += dy
+                x0 += sx
+            if doubled <= dx:
+                error += dx
+                y0 += sy
+
+    for previous, current in zip(coords, coords[1:]):
+        line(previous[0], previous[1], current[0], current[1])
+    for x, y in coords:
+        if 0 <= x < width and 0 <= y < height:
+            grid[y][x] = "."
+    x, y = coords[-1]
+    if 0 <= x < width and 0 <= y < height:
+        grid[y][x] = "@"
+    return ["".join(row) for row in grid]
+
+
+def redis_read_reply(sock):
+    marker = sock.recv(1)
+    if not marker:
+        raise ConnectionError("Redis menutup koneksi")
+    line = bytearray()
+    while not line.endswith(b"\r\n"):
+        part = sock.recv(1)
+        if not part:
+            raise ConnectionError("respons Redis tidak lengkap")
+        line.extend(part)
+    value = bytes(line[:-2])
+    if marker == b"+":
+        return value.decode("utf-8", "replace")
+    if marker == b"-":
+        raise RuntimeError("Redis: %s" % value.decode("utf-8", "replace"))
+    if marker == b":":
+        return int(value)
+    if marker == b"$":
+        length = int(value)
+        if length == -1:
+            return None
+        data = bytearray()
+        while len(data) < length + 2:
+            part = sock.recv(length + 2 - len(data))
+            if not part:
+                raise ConnectionError("respons Redis terpotong")
+            data.extend(part)
+        return bytes(data[:-2])
+    raise RuntimeError("jenis respons Redis tidak dikenal")
+
+
+def redis_command(sock, *args):
+    encoded = [str(arg).encode("utf-8") for arg in args]
+    request = [b"*" + str(len(encoded)).encode() + b"\r\n"]
+    for value in encoded:
+        request.extend((b"$" + str(len(value)).encode() + b"\r\n", value, b"\r\n"))
+    sock.sendall(b"".join(request))
+    return redis_read_reply(sock)
+
+
+def save_gps_record(url, record, retention_days=30):
+    parsed = urllib.parse.urlsplit(url)
+    if parsed.scheme not in ("redis", "rediss") or not parsed.hostname:
+        raise ValueError("REDIS_URL harus menggunakan redis:// atau rediss://")
+    try:
+        database = int(parsed.path.strip("/") or "0")
+    except ValueError as error:
+        raise ValueError("nomor database Redis tidak valid") from error
+    if not 0 <= database <= 15:
+        raise ValueError("nomor database Redis harus 0-15")
+    port = parsed.port or 6379
+    user = urllib.parse.unquote(parsed.username) if parsed.username else None
+    password = urllib.parse.unquote(parsed.password) if parsed.password else None
+    key = "pocotui:location"
+    payload = json.dumps(record, separators=(",", ":"), ensure_ascii=True)
+    context = ssl.create_default_context() if parsed.scheme == "rediss" else None
+    with socket.create_connection((parsed.hostname, port), timeout=3) as raw:
+        sock = context.wrap_socket(raw, server_hostname=parsed.hostname) if context else raw
+        sock.settimeout(3)
+        if password:
+            if user:
+                redis_command(sock, "AUTH", user, password)
+            else:
+                redis_command(sock, "AUTH", password)
+        if database:
+            redis_command(sock, "SELECT", database)
+        redis_command(sock, "XADD", key, "MAXLEN", "~", "50000", "*", "record", payload)
+        redis_command(sock, "SET", key + ":latest", payload, "EX", retention_days * 86400)
+        redis_command(sock, "EXPIRE", key, retention_days * 86400)
 
 
 def enable_modem_gps(app):
@@ -154,6 +342,71 @@ def fetch_modem_gps(app):
 def fetch_gps_menu(app):
     rc, output = sh(["gpspipe", "-w", "-n", "1"], timeout=3) if which("gpspipe") else (127, "")
     return (rc, output) if rc == 0 and output.strip() else fetch_modem_gps(app)
+
+
+class GPSRecorder(threading.Thread):
+    def __init__(self, app):
+        super().__init__(daemon=True, name="gps-redis-recorder")
+        self.app = app
+        self.stop_event = threading.Event()
+        self.last_error_log = -300.0
+        self.last_saved = None
+        self.state = "menunggu fix GPS"
+        self.track = collections.deque(maxlen=500)
+        self.track_lock = threading.Lock()
+
+    def run(self):
+        while not self.stop_event.is_set():
+            try:
+                rc, output = fetch_modem_gps(self.app)
+                if rc:
+                    self.state = "GPS tidak tersedia"
+                    now = time.monotonic()
+                    if now - self.last_error_log >= 300:
+                        self.app.log("PERINGATAN pembacaan GPS: %s" % (output or "ModemManager gagal"))
+                        self.last_error_log = now
+                    self.stop_event.wait(GPS_REDIS_INTERVAL)
+                    continue
+                if not output.strip():
+                    self.state = "menunggu data GPS"
+                    self.stop_event.wait(GPS_REDIS_INTERVAL)
+                    continue
+                location = parse_gps_nmea(output)
+                stats = dict(self.app.stats.d or {})
+                battery = stats.get("bat") or {}
+                timestamp = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())
+                if location:
+                    point = {"latitude": location["latitude"], "longitude": location["longitude"],
+                             "timestamp": timestamp}
+                    with self.track_lock:
+                        self.track.append(point)
+                record = {
+                    "timestamp": timestamp,
+                    "source": "ModemManager",
+                    "modem": GPS_MODEM,
+                    "raw_gps_data": output,
+                    "parsed_location": location,
+                    "battery_percent": battery.get("pct"),
+                    "battery_status": battery.get("status"),
+                    "charging": bool(stats.get("charger", False)),
+                    "temperature_c": stats.get("temp"),
+                    "upstream_interface": stats.get("upif"),
+                    "hotspot_active": self.app.hs.state == "on",
+                    "client_count": len(stats.get("clients") or []),
+                }
+                if REDIS_URL:
+                    save_gps_record(REDIS_URL, record, GPS_REDIS_RETENTION_DAYS)
+                    self.last_saved = time.time()
+                    self.state = ("tersimpan di Redis" if location else "data mentah tersimpan; menunggu fix")
+                else:
+                    self.state = "track lokal" if location else "menunggu fix GPS"
+            except Exception as error:
+                self.state = "Redis/GPS tidak tersedia"
+                now = time.monotonic()
+                if now - self.last_error_log >= 300:
+                    self.app.log("PERINGATAN penyimpanan GPS Redis: %s" % error)
+                    self.last_error_log = now
+            self.stop_event.wait(GPS_REDIS_INTERVAL)
 
 
 def fetch_lte_data():
@@ -1540,6 +1793,76 @@ class TextView:
         app.footer(self.hints)
 
 
+class TerminalMapScreen:
+    hints = [("VOL+", "Zoom +"), ("VOL-", "Zoom -"), ("PWR tahan", "Kembali")]
+
+    def __init__(self):
+        self.zoom = 1.0
+
+    def key(self, app, ev):
+        if ev == "up":
+            self.zoom = min(8.0, self.zoom * 1.5)
+        elif ev == "down":
+            self.zoom = max(0.25, self.zoom / 1.5)
+        elif ev in ("ok", "back"):
+            app.pop()
+
+    def draw(self, app):
+        h, w = app.size()
+        app.header(" Peta GPS Lokal ", "VOL+/-: zoom ")
+        if not GPS_ENABLED:
+            app.put(2, 2, "GPS dinonaktifkan oleh GPS_ENABLED di .env", app.c["warn"])
+            app.footer(self.hints)
+            return
+
+        cache = request_cached_data(app, "_gps_cache", lambda: fetch_modem_gps(app))
+        current = None
+        if cache and cache[1] == 0:
+            current = parse_gps_nmea(cache[2])
+        recorder = getattr(app, "gps_recorder", None)
+        points = []
+        if recorder:
+            with recorder.track_lock:
+                points = list(recorder.track)
+        if current:
+            if not points or (points[-1]["latitude"], points[-1]["longitude"]) != (
+                    current["latitude"], current["longitude"]):
+                points.append(current)
+        if not points:
+            status = recorder.state if recorder else "GPS tidak tersedia"
+            app.put(2, 2, "Belum ada posisi GPS valid.", app.c["warn"])
+            app.put(3, 2, status, app.c["dim"])
+            app.put(5, 2, "Peta ini menggambar lintasan lokal; tidak mengunduh tile peta.", app.c["dim"])
+            app.footer(self.hints)
+            return
+
+        map_y, map_x = 2, 1
+        map_h = max(3, h - app.top_margin - 6)
+        map_w = max(1, w - 2)
+        lines = terminal_track_map(points, map_w, map_h, self.zoom)
+        for row, text in enumerate(lines):
+            app.put(map_y + row, map_x, text, app.c["dim"])
+        latest = points[-1]
+        app.put(map_y + map_h, 1,
+                "@ posisi terkini  . lintasan  N ^  |  %.6f, %.6f"
+                % (latest["latitude"], latest["longitude"]), app.c["acc_b"])
+        fix_details = []
+        if current:
+            fix_details.append("%d sat" % (current.get("satellites") or 0))
+            if current.get("altitude_m") is not None:
+                fix_details.append("%.0f m" % current["altitude_m"])
+            if current.get("speed_kmh") is not None:
+                fix_details.append("%.1f km/j" % current["speed_kmh"])
+        else:
+            fix_details.append("GPS menunggu fix")
+        app.put(map_y + map_h + 1, 1,
+                "%d titik sesi  |  zoom %.1fx  |  %s  |  %s"
+                % (len(points), self.zoom, ", ".join(fix_details),
+                   recorder.state if recorder else "GPS aktif"),
+                app.c["dim"])
+        app.footer(self.hints)
+
+
 class DashScreen:
     TABS = ["Ringkasan", "Jaringan", "Klien", "Trafik", "Log"]
     hints = [("VOL+", "Tab kiri"), ("VOL-", "Tab kanan"), ("PWR", "Menu"), ("PWR tahan", "Hotspot")]
@@ -2567,14 +2890,28 @@ def gps_menu(app):
             return ["GPS dinonaktifkan oleh GPS_ENABLED di .env"]
         cache = request_cached_data(a, "_gps_menu_cache", lambda: fetch_gps_menu(a))
         if cache is None:
-            return ["Mengambil data GPS..."]
-        _, rc, output = cache
-        if rc == 0:
-            return output.splitlines()[:10] or ["(tidak ada data GPS)"]
-        return ["GPS tidak tersedia", output] if output else ["GPS tidak tersedia"]
+            lines = ["Mengambil data GPS..."]
+        else:
+            _, rc, output = cache
+            if rc == 0:
+                lines = output.splitlines()[:10] or ["(tidak ada data GPS)"]
+            else:
+                lines = ["GPS tidak tersedia", output] if output else ["GPS tidak tersedia"]
+        recorder = getattr(a, "gps_recorder", None)
+        if recorder:
+            lines += ["", "Penyimpanan Redis: %s" % recorder.state]
+            if recorder.last_saved:
+                lines.append("Terakhir disimpan: %s" % time.strftime("%H:%M:%S", time.localtime(recorder.last_saved)))
+        elif not REDIS_URL:
+            lines += ["", "Penyimpanan Redis: dinonaktifkan (.env)"]
+        return lines
 
     def build(a):
-        items = [Item("GPS", lambda a: a.push(TextView("GPS", gps_info)), value=lambda a: "info")]
+        items = [
+            Item("GPS", lambda a: a.push(TextView("GPS", gps_info)), value=lambda a: "info"),
+            Item("Peta terminal (lintasan lokal)", lambda a: a.push(TerminalMapScreen()),
+                 value=lambda a: "aktif" if GPS_ENABLED else "GPS OFF"),
+        ]
         return items
     return MenuScreen("GPS", build)
 
@@ -2904,6 +3241,7 @@ class App:
         self.hs = Hotspot(self)
         self.stats = Stats(self)
         self.upstream_monitor = UpstreamMonitor(self)
+        self.gps_recorder = GPSRecorder(self) if GPS_ENABLED and not self.demo else None
         self.buttons = None
         self.last_input = time.time()
         self.battery_low_since = None
@@ -3315,6 +3653,8 @@ class App:
         self.buttons.start()
         self.stats.start()
         self.upstream_monitor.start()
+        if self.gps_recorder:
+            self.gps_recorder.start()
         self.log("%s v%s mulai%s" % ("POCO-TUI", VERSION, " (mode demo)" if self.demo else ""))
         if self.demo:
             self.log("Mode demo: tidak ada perubahan pada sistem")
@@ -3371,6 +3711,10 @@ class App:
         self.upstream_monitor.stop_event.set()
         if self.upstream_monitor.is_alive():
             self.upstream_monitor.join(1.0)
+        if self.gps_recorder:
+            self.gps_recorder.stop_event.set()
+            if self.gps_recorder.is_alive():
+                self.gps_recorder.join(4.0)
         if self.buttons:
             self.buttons.stop_flag = True
             self.buttons.join(1.0)
