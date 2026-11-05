@@ -74,7 +74,9 @@ menghentikan capture; fitur ini dapat memakai baterai dan menaikkan suhu.
 Installer memasang FFmpeg; driver kamera dan media pipeline kernel tetap harus mendukung
 capture V4L2. Ketersediaan `/dev/video*` saja tidak menjamin kamera dapat menghasilkan frame.
 Jika viewer menampilkan error, periksa `/run/pocotui/camera.log`; FFmpeg menuliskan kegagalan
-capture di sana.
+capture di sana. Pada kernel POCO F1 yang diuji sebelumnya, `/dev/video0` gagal dengan
+`VIDIOC_STREAMON: Broken pipe`; server MJPEG tidak memperbaiki pipeline kernel tersebut,
+jadi streaming kamera nyata belum dapat dipastikan sampai masalah driver/media pipeline diatasi.
 
 Default-nya server hanya bind ke `127.0.0.1`. Untuk akses dari jaringan, atur di `.env`:
 

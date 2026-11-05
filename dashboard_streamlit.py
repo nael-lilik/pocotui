@@ -368,6 +368,7 @@ def render_dashboard():
             camera_scheme, f"{probe_host}:{camera_port}", "/health", "", "",
         ))
         cert_path = os.environ.get("CAMERA_TLS_CERT", "")
+        camera_probe_error = None
         try:
             tls_context = (
                 ssl.create_default_context(cafile=cert_path or None)
@@ -376,11 +377,14 @@ def render_dashboard():
             with urllib.request.urlopen(health_url, timeout=0.5, context=tls_context) as response:
                 health = json.load(response)
                 camera_running = response.status == 200 and isinstance(health, dict) and health.get("ok") is True
-        except (OSError, ValueError):
+                if not camera_running:
+                    camera_probe_error = "endpoint /health mengembalikan respons tidak valid"
+        except (OSError, ValueError) as error:
             camera_running = False
+            camera_probe_error = str(error)
 
         camera_cols = st.columns(4)
-        camera_cols[0].metric("Camera server", "AKTIF" if camera_running else "MATI")
+        camera_cols[0].metric("Camera server", "AKTIF" if camera_running else "TIDAK TERDETEKSI")
         camera_cols[1].metric("Device V4L2", camera_device)
         camera_cols[2].metric("Resolusi", f"{camera_width}×{camera_height}")
         camera_cols[3].metric("Batas frame rate", f"{camera_fps} FPS")
@@ -393,7 +397,9 @@ def render_dashboard():
         elif camera_running:
             st.info("Server hanya menerima koneksi lokal perangkat; atur CAMERA_HOST dan autentikasi TLS untuk viewer jaringan.")
         else:
-            st.info("Server kamera mati; kamera tidak sedang digunakan dan tidak merekam.")
+            st.info("Server kamera tidak merespons health check; kamera tidak dipastikan sedang digunakan.")
+            if camera_probe_error:
+                st.caption(f"Detail health check: {camera_probe_error}")
         st.caption(
             "Stream MJPEG hanya aktif saat ada viewer; mendukung satu viewer dan tidak menyimpan rekaman. "
             "Aktivitas kamera memakai baterai dan dapat menaikkan suhu."
