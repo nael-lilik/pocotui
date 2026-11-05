@@ -31,6 +31,7 @@ import random
 import re
 import secrets
 import select
+import shlex
 import shutil
 import signal
 import string
@@ -49,6 +50,52 @@ EVENT = struct.Struct("llHHi")         # struct input_event (native)
 MAC_RE = re.compile(r"^[0-9a-fA-F]{2}(:[0-9a-fA-F]{2}){5}$")
 
 RUN = "/run/pocotui"                   # diatur ulang di main()
+UPSTREAM_TABLE = "202"
+UPSTREAM_RULE_PRIORITY = "14200"
+ENV_FILES = (
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env"),
+    "/etc/pocotui/.env",
+    os.path.join(os.getcwd(), ".env"),
+)
+
+
+def load_project_env():
+    paths = []
+    configured_path = os.environ.get("POCOTUI_ENV_FILE")
+    if configured_path:
+        paths.append(configured_path)
+    paths.extend(ENV_FILES)
+    for path in dict.fromkeys(paths):
+        try:
+            with open(path) as env_file:
+                for number, line in enumerate(env_file, 1):
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    if line.startswith("export "):
+                        line = line[7:].lstrip()
+                    if "=" not in line:
+                        raise ValueError("%s:%d: expected KEY=VALUE" % (path, number))
+                    key, raw_value = line.split("=", 1)
+                    key = key.strip()
+                    if not key or not (key[0].isalpha() or key[0] == "_") or not all(
+                            char.isalnum() or char == "_" for char in key):
+                        raise ValueError("%s:%d: invalid environment variable name" % (path, number))
+                    try:
+                        values = shlex.split(raw_value, comments=True)
+                    except ValueError as error:
+                        raise ValueError("%s:%d: %s" % (path, number, error)) from error
+                    if len(values) > 1:
+                        raise ValueError("%s:%d: quote values containing spaces" % (path, number))
+                    os.environ.setdefault(key, values[0] if values else "")
+            return path
+        except FileNotFoundError:
+            continue
+    return None
+
+
+load_project_env()
+APN = os.environ.get("APN", "")
 
 
 # ----------------------------------------------------------------------------
@@ -117,18 +164,58 @@ def list_ifaces():
         return []
 
 
+def wifi_ifaces():
+    """Return Wi-Fi interfaces reported by sysfs or the wireless driver."""
+    names = {
+        n for n in list_ifaces()
+        if os.path.isdir("/sys/class/net/%s/wireless" % n)
+        or os.path.exists("/sys/class/net/%s/phy80211" % n)
+    }
+    if which("iw"):
+        _, out = sh(["iw", "dev"], timeout=3)
+        names.update(re.findall(r"^\s*Interface\s+(\S+)\s*$", out, re.M))
+    return sorted(names)
+
+
 def is_wifi(n):
-    return (os.path.isdir("/sys/class/net/%s/wireless" % n)
-            or os.path.isdir("/sys/class/net/%s/phy80211" % n))
+    return n in wifi_ifaces()
 
 
-def default_route_dev(exclude=None):
-    rc, out = sh("ip route show default", timeout=2)
+def default_routes(exclude=None):
+    _, out = sh(["ip", "-4", "route", "show", "table", "all"], timeout=3)
+    routes = []
+    ignored = ("docker", "veth", "br-", "virbr", "tun", "tap")
     for line in out.splitlines():
-        m = re.search(r"dev (\S+)", line)
-        if m and m.group(1) != exclude:
-            return m.group(1)
-    return None
+        if not line.startswith("default "):
+            continue
+        dev = re.search(r"\bdev\s+(\S+)", line)
+        table = re.search(r"\btable\s+(\S+)", line)
+        if (not dev or dev.group(1) == exclude or dev.group(1).startswith(ignored)
+                or table and table.group(1) == UPSTREAM_TABLE):
+            continue
+        metric = re.search(r"\bmetric\s+(\d+)", line)
+        routes.append((dev.group(1), int(metric.group(1)) if metric else 0, line))
+    return routes
+
+
+def split_nmcli_row(line):
+    fields, field = [], []
+    escaped = False
+    for char in line:
+        if escaped:
+            field.append(char)
+            escaped = False
+        elif char == "\\":
+            escaped = True
+        elif char == ":":
+            fields.append("".join(field))
+            field = []
+        else:
+            field.append(char)
+    if escaped:
+        field.append("\\")
+    fields.append("".join(field))
+    return fields
 
 
 def net_counters():
@@ -153,6 +240,7 @@ DEFAULTS = dict(
     autostart=False, brightness=60, screen_timeout=60, theme="cyan",
     ascii=False, refresh=2, blocked=[],
     virtual_ap=True, ap_name="ap0",     # AP di interface virtual; wlan0 tetap bebas
+    lte_profile="",
 )
 
 
@@ -337,6 +425,7 @@ class Hotspot:
         self.eff = None          # (band, channel) yang benar-benar dipakai
         self.fwd_changed = False
         self.base = (0, 0)
+        self.active_upstream = None
         self.adopt()
 
     # -- bantu -------------------------------------------------------------
@@ -355,6 +444,10 @@ class Hotspot:
         if self.pid("hostapd") and self.pid("dnsmasq"):
             self.state = "on"
             self.ap = self.ap_iface()
+            self.active_upstream = self.upstream_iface(self.ap)
+            ok, error = self.set_client_route(self.active_upstream, self.ap)
+            if not ok:
+                self.app.log("ERR memulihkan jalur upstream: %s" % error)
             try:
                 self.started = os.path.getmtime("%s/hostapd.pid" % RUN)
             except OSError:
@@ -362,20 +455,37 @@ class Hotspot:
 
     def phy_iface(self):
         """Interface WiFi fisik (induk) - biasanya wlan0, tetap dipakai sebagai klien."""
+        wifis = [n for n in wifi_ifaces() if n != self.cfg["ap_name"]]
         w = self.cfg["wlan"]
-        if w != "auto" and os.path.isdir("/sys/class/net/" + w):
+        if w != "auto" and w in wifis:
             return w
-        wifis = [n for n in list_ifaces() if is_wifi(n) and n != self.cfg["ap_name"]]
         if "wlan0" in wifis:
             return "wlan0"
         return wifis[0] if wifis else None
+
+    def wait_for_phy(self, timeout=10):
+        deadline = time.monotonic() + timeout
+        while True:
+            phy = self.phy_iface()
+            if phy:
+                return phy
+            if time.monotonic() >= deadline:
+                return None
+            time.sleep(0.5)
+
+    def wifi_diagnostics(self):
+        names = ", ".join(wifi_ifaces()) or "(tidak ada)"
+        _, rfkill = sh(["rfkill", "list", "wifi"], timeout=3) if which("rfkill") else (127, "rfkill tidak terpasang")
+        _, iw = sh(["iw", "dev"], timeout=3) if which("iw") else (127, "iw tidak terpasang")
+        return "Wi-Fi=%s; rfkill=%s; iw=%s" % (
+            names, (rfkill or "-").replace("\n", " ")[:100], (iw or "-").replace("\n", " ")[:100])
 
     def ap_iface(self):
         """Nama interface tempat AP berjalan (ap0 virtual, atau langsung wlan0)."""
         return self.cfg["ap_name"] if self.cfg["virtual_ap"] else self.phy_iface()
 
     def sta_freq(self, phy):
-        rc, out = sh("iw dev %s link" % phy, timeout=3)
+        rc, out = sh(["iw", "dev", phy, "link"], timeout=3)
         m = re.search(r"freq:\s*(\d+)", out)
         return int(m.group(1)) if m else None
 
@@ -383,15 +493,107 @@ class Hotspot:
         u = self.cfg["upstream"]
         if u != "auto":
             return u if os.path.isdir("/sys/class/net/" + u) else None
-        dev = default_route_dev(exclude=ap)
-        if dev:
-            return dev
-        for n in list_ifaces():
-            if n == ap or n.startswith(("docker", "veth", "br-", "virbr", "tun", "tap")):
+        return self.select_auto_upstream(ap)
+
+    def select_auto_upstream(self, ap, prefer_wifi=True, exclude_ifaces=()):
+        routes = [route for route in default_routes(exclude=ap) if route[0] not in exclude_ifaces]
+        if not routes:
+            return None
+        route_ifaces = {dev for dev, _, _ in routes}
+        wifi = self.select_wifi_upstream(ap, route_ifaces) if prefer_wifi else None
+        if wifi:
+            return wifi
+        cellular = re.compile(r"^(rmnet|wwan|ppp|ccmni|pdp|cell|lte)", re.I)
+        mobile = sorted((r for r in routes if cellular.search(r[0])), key=lambda r: r[1])
+        if mobile:
+            return mobile[0][0]
+        return min(routes, key=lambda r: r[1])[0]
+
+    def select_wifi_upstream(self, ap, route_ifaces=None):
+        if route_ifaces is None:
+            route_ifaces = {dev for dev, _, _ in default_routes(exclude=ap)}
+        for phy in wifi_ifaces():
+            if phy == ap or phy not in route_ifaces:
                 continue
-            if rd("/sys/class/net/%s/operstate" % n) in ("up", "unknown"):
-                return n
+            _, link = sh(["iw", "dev", phy, "link"], timeout=3)
+            if "Connected to " in link:
+                return phy
         return None
+
+    def radio_for_frequency(self, freq):
+        if freq < 3000:
+            channel = 14 if freq == 2484 else (freq - 2407) // 5
+            return "2.4", channel
+        return "5", (freq - 5000) // 5
+
+    def set_client_route(self, upstream, ap):
+        subnet = str(self.net())
+        route_args = ["ip", "-4", "route", "replace", subnet, "dev", ap,
+                      "table", UPSTREAM_TABLE]
+        rc, out = sh(route_args, timeout=3)
+        if rc:
+            return False, "route subnet: %s" % out[-100:]
+
+        rule = ["ip", "-4", "rule", "del", "from", subnet, "table", UPSTREAM_TABLE,
+                "priority", UPSTREAM_RULE_PRIORITY]
+        sh(rule, timeout=3)
+        if not upstream:
+            sh(["ip", "-4", "route", "del", "default", "table", UPSTREAM_TABLE], timeout=3)
+            return True, ""
+
+        _, route_out = sh(["ip", "-4", "route", "show", "default", "dev", upstream, "table", "all"], timeout=3)
+        default = next((line for line in route_out.splitlines() if line.startswith("default ")), "")
+        via = re.search(r"\bvia\s+(\S+)", default)
+        default_args = ["ip", "-4", "route", "replace", "default"]
+        if via:
+            default_args += ["via", via.group(1)]
+        default_args += ["dev", upstream, "table", UPSTREAM_TABLE]
+        if via:
+            default_args.insert(-2, "onlink")
+        rc, out = sh(default_args, timeout=3)
+        if rc:
+            return False, "route upstream %s: %s" % (upstream, out[-100:])
+        rc, out = sh(["ip", "-4", "rule", "add", "priority", UPSTREAM_RULE_PRIORITY,
+                      "from", subnet, "table", UPSTREAM_TABLE], timeout=3)
+        if rc:
+            return False, "policy rule: %s" % out[-100:]
+        return True, ""
+
+    def avoid_upstream_overlap(self, ap):
+        _, output = sh(["ip", "-4", "-o", "addr", "show"], timeout=3)
+        occupied = []
+        for line in output.splitlines():
+            iface = re.search(r"^\d+:\s+(\S+)", line)
+            address = re.search(r"\binet\s+([\d.]+/\d+)", line)
+            if not iface or iface.group(1).split("@", 1)[0] == ap or not address:
+                continue
+            try:
+                occupied.append((iface.group(1), ipaddress.ip_network(address.group(1), strict=False)))
+            except ValueError:
+                continue
+        current = self.net()
+        conflict = next(((name, net) for name, net in occupied if current.overlaps(net)), None)
+        if not conflict:
+            return
+        candidates = ("192.168.50.0/24", "10.42.0.0/24", "172.20.0.0/24",
+                      "192.168.100.0/24", "10.200.0.0/24", "172.31.0.0/24",
+                      "192.168.200.0/24", "10.240.0.0/24")
+        for candidate in candidates:
+            network = ipaddress.ip_network(candidate)
+            if all(not network.overlaps(active) for _, active in occupied):
+                self.cfg["subnet"] = candidate
+                self.cfg.save()
+                self.app.log("subnet hotspot otomatis %s (bentrok dengan %s %s)"
+                             % (candidate, conflict[0], conflict[1]))
+                return
+        raise RuntimeError("subnet hotspot %s bentrok dengan %s %s; tidak ada subnet cadangan yang aman"
+                           % (current, conflict[0], conflict[1]))
+
+    def clear_client_route(self, ap):
+        subnet = str(self.net())
+        sh(["ip", "-4", "rule", "del", "from", subnet, "table", UPSTREAM_TABLE,
+            "priority", UPSTREAM_RULE_PRIORITY], timeout=3)
+        sh(["ip", "-4", "route", "flush", "table", UPSTREAM_TABLE], timeout=3)
 
     def net(self):
         return ipaddress.ip_network(self.cfg["subnet"], strict=False)
@@ -505,14 +707,20 @@ class Hotspot:
             # tidak cukup: aturan accept harus masuk ke tabel inet filter agar
             # trafik dari/ke AP (ap0) tidak di-drop. (bug: klien dapat IP tapi
             # tidak ada internet, termasuk dengan IP statis)
-            for cmd in ("nft insert rule inet filter input iifname \"%s\" accept" % ap,
-                        "nft insert rule inet filter forward iifname \"%s\" accept" % ap,
-                        "nft insert rule inet filter forward oifname \"%s\" ct state established,related accept" % ap):
-                sh(cmd)
+            for cmd in (["nft", "insert", "rule", "inet", "filter", "input",
+                         "iifname", ap, "comment", "pocotui", "accept"],
+                        ["nft", "insert", "rule", "inet", "filter", "forward",
+                         "iifname", ap, "comment", "pocotui", "accept"],
+                        ["nft", "insert", "rule", "inet", "filter", "forward",
+                         "oifname", ap, "ct", "state", "established,related",
+                         "comment", "pocotui", "accept"]):
+                rc, out = sh(cmd)
+                if rc:
+                    app.log("PERINGATAN: aturan nftables integrasi gagal: %s" % out[-100:])
         else:
             raise RuntimeError("iptables / nftables belum terpasang")
 
-    def fw_clear(self):
+    def fw_clear(self, ap=None):
         if which("iptables"):
             for c in ["iptables -D INPUT -j POCOTUI_IN", "iptables -F POCOTUI_IN",
                       "iptables -X POCOTUI_IN", "iptables -D FORWARD -j POCOTUI_FWD",
@@ -521,6 +729,20 @@ class Hotspot:
                       "iptables -t nat -F POCOTUI", "iptables -t nat -X POCOTUI"]:
                 sh(c)
         if which("nft"):
+            if ap:
+                for chain, patterns in (
+                    ("input", (r'iifname "%s" accept' % re.escape(ap),)),
+                    ("forward", (r'iifname "%s" accept' % re.escape(ap),
+                                 r'oifname "%s" ct state established,related accept' % re.escape(ap))),
+                ):
+                    _, output = sh(["nft", "-a", "list", "chain", "inet", "filter", chain])
+                    for line in output.splitlines():
+                        if 'comment "pocotui"' not in line and not any(re.search(p, line) for p in patterns):
+                            continue
+                        handle = re.search(r"# handle (\d+)", line)
+                        if handle:
+                            sh(["nft", "delete", "rule", "inet", "filter", chain,
+                                "handle", handle.group(1)])
             sh("nft delete table ip pocotui")
 
     # -- start / stop --------------------------------------------------------
@@ -537,12 +759,18 @@ class Hotspot:
         try:
             if os.geteuid() != 0:
                 raise RuntimeError("butuh root (jalankan dengan sudo/doas)")
-            for b in ("hostapd", "dnsmasq", "ip"):
+            for b in ("hostapd", "dnsmasq", "ip", "iw"):
                 if not which(b):
                     raise RuntimeError("%s belum terpasang" % b)
-            phy = self.phy_iface()
+            if which("rfkill"):
+                rc, out = sh(["rfkill", "unblock", "wifi"], timeout=3)
+                if rc:
+                    app.log("PERINGATAN: rfkill unblock gagal: %s" % out[-100:])
+            phy = self.wait_for_phy()
             if not phy:
-                raise RuntimeError("interface WiFi tidak ditemukan")
+                raise RuntimeError("interface Wi-Fi tidak ditemukan setelah menunggu 10 detik. "
+                                   "Periksa driver/firmware, airplane mode, dan rfkill. %s"
+                                   % self.wifi_diagnostics())
             virtual = bool(c["virtual_ap"])
             ap = c["ap_name"] if virtual else phy
             self.ap = ap
@@ -551,14 +779,12 @@ class Hotspot:
             os.makedirs(RUN, exist_ok=True)
             up = self.upstream_iface(ap) if c["upstream"] == "auto" else c["upstream"]
             up_rule = None if c["upstream"] == "auto" else c["upstream"]
+            self.avoid_upstream_overlap(ap)
             app.log("AP=%s upstream=%s" % (ap, up or "(belum ada)"))
 
-            sh("rfkill unblock wifi")
             if virtual:
                 # wlan0 TIDAK disentuh: AP dibuat di interface virtual terpisah
-                if not which("iw"):
-                    raise RuntimeError("iw belum terpasang (apk add iw)")
-                rc, out = sh("iw dev %s interface add %s type __ap" % (phy, ap))
+                rc, out = sh(["iw", "dev", phy, "interface", "add", ap, "type", "__ap"])
                 if rc:
                     raise RuntimeError("gagal membuat %s di %s: %s (driver mungkin tak mendukung AP+STA)"
                                        % (ap, phy, out[-70:]))
@@ -566,32 +792,31 @@ class Hotspot:
                     o = [int(x, 16) for x in rd("/sys/class/net/%s/address" % phy).split(":")]
                     o[0] |= 0x02
                     o[5] = (o[5] + 1) & 0xFF
-                    sh("ip link set %s address %s" % (ap, ":".join("%02x" % x for x in o)))
+                    sh(["ip", "link", "set", ap, "address", ":".join("%02x" % x for x in o)])
                 except Exception:
                     pass
                 if which("nmcli"):
-                    sh("nmcli dev set %s managed no" % ap)
+                    sh(["nmcli", "dev", "set", ap, "managed", "no"])
                 f = self.sta_freq(phy)        # radio tunggal: channel AP harus = channel wlan0
                 if f:
-                    band = "2.4" if f < 3000 else "5"
-                    ch = (f - 2407) // 5 if f < 3000 else (f - 5000) // 5
-                    if f == 2484:
-                        ch = 14
+                    band, ch = self.radio_for_frequency(f)
                     if (band, ch) != self.eff:
                         app.log("channel mengikuti %s: CH %d (%s GHz)" % (phy, ch, band))
                     self.eff = (band, ch)
             else:
                 if which("nmcli"):
-                    sh("nmcli dev set %s managed no" % ap)
+                    sh(["nmcli", "dev", "set", ap, "managed", "no"])
                 if which("wpa_cli"):
-                    sh("wpa_cli -i %s terminate" % ap)
+                    sh(["wpa_cli", "-i", ap, "terminate"])
             net = self.net()
-            sh("ip link set %s down" % ap)
-            sh("ip addr flush dev %s" % ap)
-            rc, out = sh("ip addr add %s/%d dev %s" % (self.gw(), net.prefixlen, ap))
+            sh(["ip", "link", "set", ap, "down"])
+            sh(["ip", "addr", "flush", "dev", ap])
+            rc, out = sh(["ip", "addr", "add", "%s/%d" % (self.gw(), net.prefixlen), "dev", ap])
             if rc:
                 raise RuntimeError("ip addr: %s" % out[-80:])
-            sh("ip link set %s up" % ap)
+            rc, out = sh(["ip", "link", "set", ap, "up"])
+            if rc:
+                raise RuntimeError("gagal mengaktifkan interface %s: %s" % (ap, out[-80:]))
 
             self.write_hostapd(ap)
             self.write_dnsmasq(ap)
@@ -623,7 +848,11 @@ class Hotspot:
             if prev != "1":
                 wr("/proc/sys/net/ipv4/ip_forward", "1")
                 self.fwd_changed = True
+            ok, route_error = self.set_client_route(up, ap)
+            if not ok:
+                raise RuntimeError("gagal mengatur jalur upstream klien: %s" % route_error)
             self.fw_apply(ap, up_rule)
+            self.active_upstream = up
             cn = net_counters().get(ap, (0, 0))
             self.base = cn
             self.state, self.started = "on", time.time()
@@ -650,7 +879,9 @@ class Hotspot:
                     pass
         sh("pkill -f '%s/hostapd.conf'" % RUN)
         time.sleep(0.4)
-        self.fw_clear()
+        self.fw_clear(ap)
+        self.clear_client_route(ap)
+        self.active_upstream = None
         if self.fwd_changed:
             wr("/proc/sys/net/ipv4/ip_forward", "0")
             self.fwd_changed = False
@@ -677,6 +908,133 @@ class Hotspot:
         self._cleanup(self.ap or self.ap_iface())
         self.state, self.error = "off", ""
         self.app.log("hotspot dimatikan")
+
+
+class UpstreamMonitor(threading.Thread):
+    def __init__(self, app):
+        super().__init__(daemon=True)
+        self.app = app
+        self.stop_event = threading.Event()
+        self.last_lte_action = 0.0
+        self.last_lte_target = None
+        self.last_wifi_probe = 0.0
+        self.wifi_probe_iface = None
+        self.wifi_probe_result = None
+        self.last_wifi_state = None
+        self.lte_active = None
+        self.last_route_error = None
+        self.last_radio_attempt = 0.0
+        self.last_lte_error = None
+
+    def run(self):
+        while not self.stop_event.wait(5):
+            hs = self.app.hs
+            if self.app.demo or hs.state != "on":
+                continue
+            try:
+                wifi = self.usable_wifi(hs)
+                self.sync_lte(hs, wifi)
+                self.sync_upstream(hs, wifi)
+                self.sync_radio(hs)
+            except Exception as e:
+                self.app.log("ERR monitor upstream: %s" % e)
+
+    def sync_lte(self, hs, wifi):
+        profile = hs.cfg["lte_profile"]
+        if hs.cfg["upstream"] != "auto" or not profile or not which("nmcli"):
+            self.lte_active = None
+            return
+        desired_active = not bool(wifi)
+        rc, output = sh(["nmcli", "-t", "--escape", "yes", "-f", "UUID",
+                         "connection", "show", "--active"], timeout=5)
+        if rc:
+            self.lte_active = None
+            message = "PERINGATAN: gagal memeriksa profil LTE: %s" % output[-100:]
+            if message != self.last_lte_error:
+                self.app.log(message)
+                self.last_lte_error = message
+            return
+        self.last_lte_error = None
+        active = profile in {line.strip() for line in output.splitlines()}
+        self.lte_active = active
+        if active == desired_active:
+            self.last_lte_target = desired_active
+            return
+        if (self.last_lte_target == desired_active
+                and time.monotonic() - self.last_lte_action < 30):
+            return
+        command = ["nmcli", "connection", "down" if wifi else "up", "uuid", profile]
+        self.last_lte_target = desired_active
+        rc, output = sh(command, timeout=25)
+        self.last_lte_action = time.monotonic()
+        if rc:
+            self.app.log("PERINGATAN: LTE %s gagal: %s" % ("standby" if wifi else "backup", output[-100:]))
+        else:
+            self.last_lte_target = desired_active
+            self.app.log("LTE %s" % ("standby (Wi-Fi upstream aktif)" if wifi else "backup diaktifkan"))
+
+    def usable_wifi(self, hs):
+        iface = hs.select_wifi_upstream(hs.ap)
+        if not iface:
+            if self.last_wifi_state is not None:
+                self.app.log("Wi-Fi upstream terputus")
+            self.last_wifi_state = None
+            self.wifi_probe_iface = None
+            self.wifi_probe_result = None
+            return None
+        if not which("ping"):
+            return iface
+        now = time.monotonic()
+        if iface != self.wifi_probe_iface or now - self.last_wifi_probe >= 20:
+            rc, _ = sh(["ping", "-I", iface, "-c", "1", "-W", "2", "1.1.1.1"], timeout=4)
+            self.wifi_probe_iface = iface
+            self.wifi_probe_result = rc == 0
+            self.last_wifi_probe = now
+        online = bool(self.wifi_probe_result)
+        if online != self.last_wifi_state:
+            self.app.log("Wi-Fi upstream %s: %s" % ("online" if online else "tanpa internet", iface))
+            self.last_wifi_state = online
+        return iface if online else None
+
+    def sync_upstream(self, hs, wifi):
+        if hs.cfg["upstream"] != "auto":
+            return
+        excluded = set() if wifi else set(wifi_ifaces())
+        if not wifi and self.wifi_probe_iface:
+            excluded.add(self.wifi_probe_iface)
+        upstream = hs.select_auto_upstream(hs.ap, prefer_wifi=bool(wifi), exclude_ifaces=excluded)
+        if upstream == hs.active_upstream:
+            return
+        ok, error = hs.set_client_route(upstream, hs.ap)
+        if not ok:
+            if error != self.last_route_error:
+                self.app.log("ERR pindah upstream %s: %s" % (upstream or "(none)", error))
+                self.last_route_error = error
+            return
+        self.last_route_error = None
+        old = hs.active_upstream
+        hs.active_upstream = upstream
+        self.app.log("upstream otomatis: %s -> %s" % (old or "(none)", upstream or "(none)"))
+
+    def sync_radio(self, hs):
+        phy = hs.phy_iface()
+        if not phy:
+            return
+        freq = hs.sta_freq(phy)
+        if not freq:
+            return
+        radio = hs.radio_for_frequency(freq)
+        if radio == hs.eff or self.app.busy or time.monotonic() - self.last_radio_attempt < 30:
+            return
+        self.last_radio_attempt = time.monotonic()
+        self.app.log("channel upstream berubah; menyesuaikan AP ke CH %d (%s GHz)" % (radio[1], radio[0]))
+
+        def restart():
+            hs.stop()
+            hs.start()
+
+        self.app.job("Menyesuaikan kanal AP", restart,
+                     then=lambda _: self.app.toast("Hotspot mengikuti channel Wi-Fi upstream", "good"))
 
 
 # ----------------------------------------------------------------------------
@@ -886,8 +1244,9 @@ class Item:
 class MenuScreen:
     hints = [("VOL+", "Naik"), ("VOL-", "Turun"), ("PWR", "Pilih"), ("PWR tahan", "Kembali")]
 
-    def __init__(self, title, build):
+    def __init__(self, title, build, on_back=None):
         self.title, self.build, self.sel = title, build, 0
+        self.on_back = on_back
 
     def key(self, app, ev):
         items = self.build(app)
@@ -909,6 +1268,8 @@ class MenuScreen:
                 app.toast("Tidak tersedia saat ini", "warn")
         elif ev == "back":
             app.pop()
+            if self.on_back:
+                self.on_back()
 
     def draw(self, app):
         h, w = app.size()
@@ -947,9 +1308,10 @@ class EditScreen:
     ACTIONS = ["[SIMPAN]", "[HAPUS]", "[KOSONGKAN]", "[BATAL]"]
     hints = [("VOL+/-", "Pilih karakter"), ("PWR", "Ketik"), ("PWR tahan", "Hapus 1")]
 
-    def __init__(self, title, text, on_done, validate=None, maxlen=63, note=""):
+    def __init__(self, title, text, on_done, validate=None, maxlen=63, note="", on_cancel=None):
         self.title, self.text, self.on_done = title, text, on_done
         self.validate, self.maxlen, self.note = validate, maxlen, note
+        self.on_cancel = on_cancel
         self.ring = list(self.CHARS) + self.ACTIONS
         self.i = 0
 
@@ -979,6 +1341,8 @@ class EditScreen:
                 self.text = ""
             elif t == "[BATAL]":
                 app.pop()
+                if self.on_cancel:
+                    self.on_cancel()
             elif len(self.text) < self.maxlen:
                 self.text += t
 
@@ -1071,7 +1435,7 @@ class TextView:
 
 
 class DashScreen:
-    TABS = ["Ringkasan", "Klien", "Trafik", "Log"]
+    TABS = ["Ringkasan", "Jaringan", "Klien", "Trafik", "Log"]
     hints = [("VOL+", "Tab kiri"), ("VOL-", "Tab kanan"), ("PWR", "Menu"), ("PWR tahan", "Hotspot")]
 
     def __init__(self):
@@ -1102,7 +1466,7 @@ class DashScreen:
                    "%s %s  %s%s " % (S["on"] if hs.state == "on" else S["off"], state, btxt, time.strftime("%H:%M")))
         app.tabbar(1, self.TABS, self.tab)
         y0, y1 = 2, h - 2
-        [self.ov, self.cl, self.tr, self.lg][self.tab](app, d, y0, y1, w)
+        [self.ov, self.nw, self.cl, self.tr, self.lg][self.tab](app, d, y0, y1, w)
         app.footer(self.hints)
 
     # -- tab: ringkasan ------------------------------------------------------------
@@ -1159,10 +1523,12 @@ class DashScreen:
         except Exception:
             gw = "?"
         rows.append([("Gateway  ", dim), (gw, c["wh"]), ("   DNS " + ",".join(cfg["dns"][:1]), dim)])
-        up = d.get("upif")
+        up = hs.active_upstream if st == "on" else d.get("upif")
         uip = (d.get("ips") or {}).get(up, "") if up else ""
+        mode = "AUTO" if cfg["upstream"] == "auto" else "MANUAL"
         rows.append([("Upstream ", dim),
-                     ((up or "(belum ada)") + ("  " + uip if uip else ""), c["wh"] if up else c["warn"]),
+                     (mode + "  " + (up or "(belum ada)") + ("  " + uip if uip else ""),
+                      c["wh"] if up else c["warn"]),
                      ("   NAT " + ("ON" if cfg["nat"] else "OFF"), dim)])
         ms, ts = d.get("ping", (None, 0))
         if not ts:
@@ -1183,6 +1549,54 @@ class DashScreen:
         rows.append([("ip_fwd   ", dim), ((S["on"] if fwd else S["off"]) + (" 1" if fwd else " 0"), c["good"] if fwd else c["bad"])])
         rows.append([("NAT      ", dim), (("aktif" if hs.state == "on" and cfg["nat"] else "mati"), c["good"] if (hs.state == "on" and cfg["nat"]) else dim)])
         return rows
+
+    def nw(self, app, d, y0, y1, w):
+        c, hs = app.c, app.hs
+        monitor = app.upstream_monitor
+        dim = c["dim"]
+        up = hs.active_upstream if hs.state == "on" else d.get("upif")
+        uip = (d.get("ips") or {}).get(up, "") if up else ""
+        wifi_iface = monitor.wifi_probe_iface
+        if wifi_iface and monitor.wifi_probe_result is not None:
+            wifi_status = "online" if monitor.wifi_probe_result else "tersambung, internet gagal"
+            wifi_color = c["good"] if monitor.wifi_probe_result else c["bad"]
+        else:
+            wifi_status, wifi_color = "tidak terhubung / belum diuji", dim
+        profile = app.cfg["lte_profile"]
+        if app.cfg["upstream"] != "auto":
+            lte_status, lte_color = "nonaktif (mode manual)", dim
+        elif not profile:
+            lte_status, lte_color = "profil backup belum dipilih", dim
+        elif monitor.lte_active is True:
+            lte_status, lte_color = "aktif", c["good"]
+        elif monitor.lte_active is False:
+            lte_status, lte_color = "standby", c["warn"]
+        else:
+            lte_status, lte_color = "status belum diketahui", dim
+        route_kind = "Wi-Fi" if up and (
+            up == wifi_iface or re.match(r"^(wlan|wlp|wlx|wifi)", up, re.I)) else (
+                "LTE" if up and re.match(r"^(rmnet|wwan|ppp|ccmni|pdp|cell|lte)", up, re.I) else "lainnya")
+        rows = [
+            [("Mode       ", dim), ("otomatis" if app.cfg["upstream"] == "auto" else "manual", c["acc"])],
+            [("Jalur aktif", dim), ((route_kind + " / " + up) if up else "belum ada upstream",
+                                    c["good"] if up else c["bad"])],
+            [("Alamat IPv4", dim), (uip or "-", c["wh"])],
+            [("Wi-Fi      ", dim), ((wifi_iface + ": " if wifi_iface else "") + wifi_status, wifi_color)],
+            [("LTE backup ", dim), (lte_status, lte_color)],
+            [("Ping sistem", dim), ("online %.0f ms" % d["ping"][0] if d.get("ping", (None, 0))[0] is not None
+                                    else "tidak terjangkau", c["good"] if d.get("ping", (None, 0))[0] is not None else c["warn"])],
+        ]
+        y = y0
+        if w >= 100:
+            left_w = w // 2
+            app.panel(y, 0, left_w - 1, "UPSTREAM", rows, y1 - y)
+            app.panel(y, left_w, w - left_w, "MODEM LTE", self.rows_lte(app, d, w - left_w - 4),
+                      y1 - y)
+            return
+        used = app.panel(y, 0, w, "UPSTREAM", rows, max(3, (y1 - y0) // 2))
+        y += used
+        if y < y1:
+            app.panel(y, 0, w, "MODEM LTE", self.rows_lte(app, d, w - 4), y1 - y)
 
     def rows_net(self, app, d, inner):
         c, S = app.c, app.sym
@@ -1416,11 +1830,11 @@ def confirm(app, text, on_yes):
     ]))
 
 
-def chooser(app, title, options, current, on_pick):
+def chooser(app, title, options, current, on_pick, on_back=None):
     def build(a):
         return [Item(lbl, (lambda a, v=val: (a.pop(), on_pick(v))), value=(app.sym["on"] if val == current else ""))
                 for lbl, val in options]
-    sc = MenuScreen(title, build)
+    sc = MenuScreen(title, build, on_back=on_back)
     for i, (_, val) in enumerate(options):
         if val == current:
             sc.sel = i
@@ -1557,6 +1971,8 @@ def show_conn(app):
                 "  Gateway      : %s" % gw, "  Rentang DHCP : %s" % rng,
                 "  DNS klien    : %s" % ", ".join(c["dns"]),
                 "  Upstream     : %s  %s" % (up or "-", (d.get("ips") or {}).get(up, "")),
+                "  Mode upstream: %s" % ("otomatis" if c["upstream"] == "auto" else "manual"),
+                "  Radio AP     : %s" % (("%s GHz CH %s" % hs.eff) if hs.eff else "-"),
                 "  NAT          : %s" % ("aktif" if c["nat"] else "mati (hanya LAN lokal)"),
                 "  Diblokir     : %d perangkat" % len(c["blocked"])]
     app.push(TextView("Info Koneksi", lines))
@@ -1566,12 +1982,14 @@ def show_ifaces(app):
     def lines(a):
         d = a.stats.d or {}
         cn = net_counters()
-        out = ["  %-12s %-8s %-18s %s" % ("IFACE", "STATUS", "IP", "RX / TX")]
+        out = ["  %-12s %-8s %-6s %-18s %s" % ("IFACE", "STATUS", "TYPE", "IP", "RX / TX")]
         names = list_ifaces() if not a.demo else ["wlan0", "usb0", "wwan0"]
+        wifis = set(wifi_ifaces()) if not a.demo else {"wlan0"}
         for n in names:
             st = rd("/sys/class/net/%s/operstate" % n, "up")
             rx, tx = cn.get(n, (0, 0))
-            out.append("  %-12s %-8s %-18s %s / %s" % (n, st, (d.get("ips") or {}).get(n, "-"), fmt_bytes(rx), fmt_bytes(tx)))
+            kind = "Wi-Fi" if n in wifis else ""
+            out.append("  %-12s %-8s %-6s %-18s %s / %s" % (n, st, kind, (d.get("ips") or {}).get(n, "-"), fmt_bytes(rx), fmt_bytes(tx)))
         return out
     app.push(TextView("Interface Jaringan", lines))
 
@@ -1585,61 +2003,218 @@ def ping_test(app):
         return out
     app.job("Tes ping", fn, then=lambda r: app.push(TextView("Hasil Ping", ["", ] + ["  " + l for l in r.splitlines()])))
 
-def refresh_wlan0(app):
+def refresh_wifi(app):
     def fn():
         if app.demo:
             time.sleep(0.8)
             return
-        phy = app.hs.phy_iface() or "wlan0"
-        sh("rfkill unblock wifi")
-        sh("ip link set %s down" % phy)
-        time.sleep(0.5)
-        sh("ip link set %s up" % phy)
+        if which("rfkill"):
+            sh(["rfkill", "unblock", "wifi"], timeout=3)
+        phy = app.hs.wait_for_phy(timeout=2)
+        if not phy:
+            raise RuntimeError("interface Wi-Fi tidak ditemukan. %s" % app.hs.wifi_diagnostics())
         if which("nmcli"):
-            sh("nmcli dev wifi rescan ifname %s" % phy, timeout=8)
-        elif which("iw"):
-            sh("iw dev %s scan" % phy, timeout=8)
-    app.job("Refresh wlan0", fn, then=lambda r: app.toast("wlan0 di-refresh", "good"))
-
-def connect_wlan0(app):
-    def ask_ssid():
-        def on_ssid(ssid):
-            if not ssid:
-                app.toast("SSID kosong", "warn")
+            rc, out = sh(["nmcli", "dev", "wifi", "rescan", "ifname", phy], timeout=10)
+            if rc == 0:
                 return
-            def on_psk(psk):
-                def fn():
-                    if app.demo:
-                        time.sleep(1.0)
-                        return
-                    phy = app.hs.phy_iface() or "wlan0"
-                    if which("nmcli"):
-                        cmd = ["nmcli", "dev", "wifi", "connect", ssid]
-                        if psk:
-                            cmd += ["password", psk]
-                        cmd += ["ifname", phy]
-                        rc, out = sh(cmd, timeout=25)
-                        if rc != 0:
-                            raise RuntimeError(out[-90:] or "nmcli gagal")
-                    elif which("wpa_cli"):
-                        rc, out = sh("wpa_cli -i %s add_network" % phy, timeout=5)
-                        # konfigurasi minimal via wpa_cli tidak lengkap; sarankan nmcli
-                        raise RuntimeError("Gunakan nmcli untuk menyambung (wpa_cli manual tidak didukung)")
-                    else:
-                        raise RuntimeError("nmcli/wpa_cli belum terpasang")
-                app.job("Sambungkan wlan0 ke %s" % ssid, fn,
-                        then=lambda r: app.toast("wlan0 tersambung: %s" % ssid, "good"))
-            app.push(EditScreen("Kata sandi WiFi (kosong=terbuka)", "", on_psk,
-                                lambda t: None, 63, "WPA2/WPA3, kosongkan jika terbuka"))
-        app.push(EditScreen("SSID WiFi tujuan", "", on_ssid, lambda t: None if 1 <= len(t) <= 32 else "SSID 1-32 karakter", 32))
-    ask_ssid()
-    def fn():
+            app.log("nmcli rescan gagal (%s), mencoba iw" % out[-80:])
+        if which("iw"):
+            rc, out = sh(["iw", "dev", phy, "scan"], timeout=12)
+            if rc == 0:
+                return
+            raise RuntimeError("scan %s gagal: %s" % (phy, out[-100:]))
+        raise RuntimeError("nmcli/iw belum terpasang untuk scan Wi-Fi")
+    app.job("Scan ulang Wi-Fi", fn, then=lambda r: app.toast("Wi-Fi di-refresh", "good"))
+
+def connect_wifi(app):
+    resume_hotspot = app.hs.state == "on"
+
+    def restore_hotspot():
+        if resume_hotspot and app.hs.state == "off":
+            app.job("Menyalakan kembali hotspot", app.hs.start,
+                    then=lambda _: app.toast("Hotspot kembali aktif", "good"))
+
+    def scan():
         if app.demo:
-            time.sleep(1.5)
-            return "PING 1.1.1.1: 4 paket, 0% loss\nrtt min/avg/max = 19.2/24.8/33.1 ms (demo)"
-        rc, out = sh("ping -c 4 -W 2 1.1.1.1", timeout=15)
-        return out
-    app.job("Tes ping", fn, then=lambda r: app.push(TextView("Hasil Ping", ["", ] + ["  " + l for l in r.splitlines()])))
+            return "wlan0", [("Demo-WiFi", "WPA2", 87), ("Guest", "--", 42)]
+        if not which("nmcli"):
+            raise RuntimeError("Wizard Wi-Fi memerlukan NetworkManager/nmcli")
+        if which("rfkill"):
+            sh(["rfkill", "unblock", "wifi"], timeout=3)
+        phy = app.hs.wait_for_phy(timeout=2)
+        if not phy:
+            raise RuntimeError("interface Wi-Fi tidak ditemukan. %s" % app.hs.wifi_diagnostics())
+        sh(["nmcli", "dev", "wifi", "rescan", "ifname", phy], timeout=15)
+        rc, out = sh(["nmcli", "-t", "--escape", "yes", "-f", "SSID,SIGNAL,SECURITY",
+                      "dev", "wifi", "list", "ifname", phy, "--rescan", "no"], timeout=15)
+        if rc:
+            raise RuntimeError(out[-120:] or "gagal memindai jaringan Wi-Fi")
+        by_ssid = {}
+        for line in out.splitlines():
+            fields = split_nmcli_row(line)
+            if len(fields) < 3 or not fields[0]:
+                continue
+            try:
+                signal_pct = int(fields[1])
+            except ValueError:
+                signal_pct = 0
+            record = (fields[0], fields[2] or "--", signal_pct)
+            if fields[0] not in by_ssid or signal_pct > by_ssid[fields[0]][2]:
+                by_ssid[fields[0]] = record
+        return phy, sorted(by_ssid.values(), key=lambda row: (-row[2], row[0].lower()))
+
+    def connect_selected(phy, ssid, security, password="", hidden=False):
+        def fn():
+            try:
+                if app.demo:
+                    time.sleep(0.5)
+                else:
+                    cmd = ["nmcli", "dev", "wifi", "connect", ssid]
+                    if password:
+                        cmd += ["password", password]
+                    cmd += ["ifname", phy]
+                    if hidden:
+                        cmd += ["hidden", "yes"]
+                    rc, out = sh(cmd, timeout=35)
+                    if rc:
+                        raise RuntimeError(out[-120:] or "gagal menyambungkan Wi-Fi")
+                    uuid_rc, uuid = sh(["nmcli", "-g", "GENERAL.CON-UUID", "device", "show", phy], timeout=5)
+                    if uuid_rc or not re.fullmatch(r"[0-9a-fA-F-]{36}", uuid.strip()):
+                        raise RuntimeError("Wi-Fi tersambung, tetapi profil NetworkManager tidak ditemukan")
+                    rc, out = sh(["nmcli", "connection", "modify", "uuid", uuid.strip(),
+                                  "connection.autoconnect", "yes", "connection.autoconnect-priority", "100",
+                                  "ipv4.route-metric", "100", "ipv6.route-metric", "100"], timeout=8)
+                    if rc:
+                        raise RuntimeError("Wi-Fi tersambung, gagal menyimpan auto-connect: %s" % out[-100:])
+                    app.cfg["upstream"] = "auto"
+                    app.cfg.save()
+                if resume_hotspot:
+                    app.hs.start()
+            except Exception:
+                if resume_hotspot and app.hs.state == "off":
+                    app.hs.start()
+                raise
+
+        app.job("Menyambungkan Wi-Fi", fn,
+                then=lambda _: app.toast("Wi-Fi %s tersimpan; upstream otomatis aktif" % ssid, "good", 5))
+
+    def choose_network(result):
+        phy, networks = result
+        options = [("%s  %d%%  %s" % (ssid, signal_pct, security), (ssid, security))
+                   for ssid, security, signal_pct in networks]
+        options += [("Jaringan tersembunyi / masukkan SSID", "__hidden__"), ("Batal", "__cancel__")]
+
+        def selected(value):
+            if value == "__cancel__":
+                restore_hotspot()
+            elif value == "__hidden__":
+                app.push(EditScreen("SSID Wi-Fi", "", lambda ssid: choose_security(phy, ssid, "WPA2", True),
+                                    lambda text: None if 1 <= len(text.encode("utf-8")) <= 32 else "SSID harus 1-32 byte",
+                                    32, on_cancel=restore_hotspot))
+            else:
+                choose_security(phy, value[0], value[1])
+
+        if not networks:
+            app.toast("Tidak ada jaringan terdeteksi; pilih SSID tersembunyi", "warn", 5)
+        app.push(chooser(app, "Pilih upstream Wi-Fi", options, None, selected,
+                         on_back=restore_hotspot))
+
+    def choose_security(phy, ssid, security, hidden=False):
+        if not ssid:
+            app.toast("SSID tidak boleh kosong", "warn")
+            return
+        if security in ("", "--", "OPEN"):
+            connect_selected(phy, ssid, security, hidden=hidden)
+            return
+        app.push(EditScreen("Sandi Wi-Fi: %s" % ssid, "",
+                            lambda password: connect_selected(phy, ssid, security, password, hidden),
+                            lambda text: None if not text or 8 <= len(text) <= 63 else "Sandi WPA harus 8-63 karakter",
+                            63, "Sandi disimpan di profil NetworkManager. Profil diatur auto-connect.",
+                            on_cancel=restore_hotspot))
+
+    def start_scan():
+        def scan_and_restore():
+            try:
+                return scan()
+            except Exception:
+                if resume_hotspot and app.hs.state == "off":
+                    app.hs.start()
+                raise
+
+        app.job("Memindai jaringan Wi-Fi", scan_and_restore, then=choose_network)
+
+    if resume_hotspot:
+        confirm(app, "Wi-Fi satu radio: scan perlu menjeda hotspot dan memutus klien. Lanjutkan?",
+                lambda: app.job("Menjeda hotspot", app.hs.stop, then=lambda _: start_scan()))
+    else:
+        start_scan()
+
+
+def configure_lte_backup(app):
+    def list_profiles():
+        if not which("nmcli"):
+            raise RuntimeError("Profil LTE otomatis memerlukan NetworkManager/nmcli")
+        rc, output = sh(["nmcli", "-t", "--escape", "yes", "-f", "UUID,NAME,TYPE",
+                         "connection", "show"], timeout=8)
+        if rc:
+            raise RuntimeError(output[-120:] or "gagal membaca profil NetworkManager")
+        profiles = []
+        for line in output.splitlines():
+            fields = split_nmcli_row(line)
+            if len(fields) >= 3 and fields[2] in ("gsm", "cdma"):
+                profiles.append((fields[0], fields[1], fields[2]))
+        return profiles
+
+    def activate_profile(uuid, name):
+        def fn():
+            rc, output = sh(["nmcli", "connection", "modify", "uuid", uuid,
+                             "connection.autoconnect", "no", "connection.autoconnect-priority", "10",
+                             "ipv4.route-metric", "700", "ipv6.route-metric", "700"], timeout=8)
+            if rc:
+                raise RuntimeError(output[-120:] or "gagal mengatur profil LTE")
+            app.cfg["lte_profile"] = uuid
+            app.cfg.save()
+
+        app.job("Mengatur profil LTE backup", fn,
+                then=lambda _: app.toast("LTE aktif otomatis saat Wi-Fi upstream terputus: %s" % name, "good", 6))
+
+    def create_profile(apn):
+        def fn():
+            rc, output = sh(["nmcli", "connection", "add", "type", "gsm", "ifname", "*",
+                             "con-name", "POCO-TUI LTE", "gsm.apn", apn], timeout=15)
+            if rc:
+                raise RuntimeError(output[-120:] or "gagal membuat profil LTE")
+            match = re.search(r"\(([0-9a-fA-F-]{36})\)", output)
+            if not match:
+                raise RuntimeError("NetworkManager membuat profil, tetapi UUID tidak ditemukan")
+            uuid = match.group(1)
+            rc, output = sh(["nmcli", "connection", "modify", "uuid", uuid,
+                             "connection.autoconnect", "no", "connection.autoconnect-priority", "10",
+                             "ipv4.route-metric", "700", "ipv6.route-metric", "700"], timeout=8)
+            if rc:
+                raise RuntimeError("Profil dibuat, tetapi pengaturan backup gagal: %s" % output[-100:])
+            app.cfg["lte_profile"] = uuid
+            app.cfg.save()
+
+        app.job("Membuat profil LTE backup", fn,
+                then=lambda _: app.toast("Profil LTE tersimpan; modem akan aktif saat Wi-Fi upstream terputus", "good", 6))
+
+    def show_profiles(profiles):
+        options = [("%s (%s)" % (name, kind), uuid) for uuid, name, kind in profiles]
+        options.append(("Buat profil LTE baru (masukkan APN)", "__create__"))
+
+        def selected(value):
+            if value == "__create__":
+                app.push(EditScreen("APN operator", APN, create_profile,
+                                    lambda text: None if 1 <= len(text) <= 100 else "APN harus 1-100 karakter",
+                                    100, "APN dari .env (dapat diedit); cek nilai tepat ke operator seluler."))
+            else:
+                name = next((name for uuid, name, _ in profiles if uuid == value), value)
+                activate_profile(value, name)
+
+        app.push(chooser(app, "Pilih profil LTE backup", options, app.cfg["lte_profile"], selected))
+
+    app.job("Membaca profil LTE", list_profiles, then=show_profiles)
 
 
 class LogScreen(TextView):
@@ -1672,9 +2247,15 @@ def device_info(app):
         d = a.stats.d or {}
         mt = (d.get("mem") or (0, 0))[0]
         btn = a.buttons.devices if a.buttons else []
+        wifis = wifi_ifaces()
+        rfkill = sh(["rfkill", "list", "wifi"], timeout=3)[1] if which("rfkill") else "rfkill tidak terpasang"
+        rfkill_state = ", ".join(line.strip() for line in rfkill.splitlines()
+                                 if "blocked:" in line.lower()) or (rfkill.splitlines()[0] if rfkill else "tidak ada output")
         return ["", "  Model   : %s" % model, "  Kernel  : %s %s" % (u.sysname, u.release),
                 "  Arsitek.: %s" % u.machine, "  RAM     : %s" % fmt_bytes(mt),
                 "  Python  : %s" % sys.version.split()[0],
+                "  Wi-Fi   : %s" % (", ".join(wifis) if wifis else "tidak terdeteksi"),
+                "  rfkill  : %s" % rfkill_state[:70],
                 "  Tombol  : %s" % ("; ".join(btn) if btn else "tidak terdeteksi (pakai keyboard)"),
                 "  Config  : %s" % a.cfg.path, "  Runtime : %s" % RUN]
     app.push(TextView("Info Perangkat", lines))
@@ -1838,25 +2419,36 @@ def dashboard_menu(app):
         return items
     return MenuScreen("Web Dashboard", build)
 
+
+def settings_menu(app):
+    return MenuScreen("Pengaturan", lambda a: [
+        Item("Hotspot / WiFi", lambda a: a.push(wifi_menu(a))),
+        Item("Tampilan & daya", lambda a: a.push(display_menu(a))),
+    ])
+
+
+def services_menu(app):
+    return MenuScreen("Monitoring & layanan", lambda a: [
+        Item("Snort", lambda a: a.push(snort_menu(a))),
+        Item("Suricata", lambda a: a.push(suricata_menu(a))),
+        Item("LTE", lambda a: a.push(lte_menu(a))),
+        Item("GPS", lambda a: a.push(gps_menu(a))),
+        Item("Web dashboard", lambda a: a.push(dashboard_menu(a))),
+    ])
+
+
 def main_menu(app):
     def build(a):
         n = len((a.stats.d or {}).get("clients") or [])
-        st = a.hs.state
         return [
             Item("Hotspot", lambda a: a.push(hotspot_menu(a)), value=lambda a: {"on": "AKTIF", "off": "mati", "error": "ERROR"}.get(a.hs.state, "...")),
-            # (nilai di atas tampil di kanan baris)
             Item("Klien", lambda a: a.push(clients_menu(a)), value=lambda a: "%d terhubung" % n),
             Item("Jaringan", lambda a: a.push(network_menu(a))),
-            Item("Pengaturan Hotspot", lambda a: a.push(wifi_menu(a))),
-            Item("Tampilan & Daya", lambda a: a.push(display_menu(a))),
+            Item("Pengaturan", lambda a: a.push(settings_menu(a))),
+            Item("Monitoring & layanan", lambda a: a.push(services_menu(a))),
             Item("Log", lambda a: a.push(LogScreen())),
-            Item("Snort", lambda a: a.push(snort_menu(a))),
-            Item("Suricata", lambda a: a.push(suricata_menu(a))),
-            Item("LTE", lambda a: a.push(lte_menu(a))),
-            Item("GPS", lambda a: a.push(gps_menu(a))),
             Item("Sistem", lambda a: a.push(system_menu(a))),
             Item("Bantuan / peta tombol", lambda a: a.push(TextView("Bantuan", HELP))),
-            Item("Tutup menu", lambda a: a.pop()),
         ]
     return MenuScreen("Menu Utama", build)
 
@@ -1914,36 +2506,38 @@ def blocked_menu(app):
 DNS_PRESETS = [("Cloudflare 1.1.1.1", ["1.1.1.1", "1.0.0.1"]), ("Google 8.8.8.8", ["8.8.8.8", "8.8.4.4"]),
                ("Quad9 9.9.9.9", ["9.9.9.9", "149.112.112.112"]),
                ("AdGuard (blokir iklan)", ["94.140.14.14", "94.140.15.15"])]
-SUBNETS = ["192.168.50.0/24", "10.42.0.0/24", "172.20.0.0/24", "192.168.100.0/24"]
+SUBNETS = ["192.168.50.0/24", "10.42.0.0/24", "172.20.0.0/24", "192.168.100.0/24",
+           "10.200.0.0/24", "172.31.0.0/24", "192.168.200.0/24", "10.240.0.0/24"]
 
 
 def switch_upstream(app):
-    cur = app.cfg["upstream"]
-    if cur == "wlan0":
-        new = "rmnet_ipa0"
-    elif cur == "rmnet_ipa0":
-        new = "wlan0"
-    else:
-        new = "wlan0"
-    if not os.path.isdir("/sys/class/net/" + new):
-        app.toast("Interface %s tidak ada" % new, "bad", 4)
+    ap = app.hs.ap or app.hs.ap_iface()
+    devices = []
+    for name in list_ifaces():
+        if name == ap or name.startswith(("docker", "veth", "br-", "virbr", "tun", "tap")):
+            continue
+        if rd("/sys/class/net/%s/operstate" % name) not in ("up", "unknown"):
+            continue
+        rc, out = sh(["ip", "-4", "-o", "addr", "show", "dev", name], timeout=2)
+        if rc == 0 and re.search(r"\binet\s+\d", out):
+            devices.append(name)
+    if not devices:
+        app.toast("Tidak ada interface upstream aktif dengan alamat IPv4", "bad", 4)
         return
-    # periksa IP & rute default pada interface target
-    rc, out = sh("ip -4 -o addr show dev %s" % new, timeout=2)
-    has_ip = bool(re.search(r"inet \d", out or ""))
-    rc2, out2 = sh("ip route show default dev %s" % new, timeout=2)
-    has_route = bool(out2.strip())
+    options = ["auto"] + devices
+    cur = app.cfg["upstream"]
+    if cur == "auto":
+        cur = app.hs.upstream_iface(ap) or "auto"
+    if cur not in options:
+        cur = "auto"
+    new = options[(options.index(cur) + 1) % len(options)]
     app.cfg["upstream"] = new
     app.cfg.save()
-    app.log("upstream switch: %s -> %s (ip=%s route=%s)" % (cur, new, has_ip, has_route))
+    app.log("upstream switch: %s -> %s" % (cur, new))
     if app.hs.state == "on":
         restart_hotspot(app)
     else:
         app.toast("Upstream: %s (aktifkan hotspot untuk menerapkan)" % new, "info", 4)
-    if not has_ip:
-        app.toast("PERINGATAN: %s belum punya IP" % new, "warn", 5)
-    if not has_route:
-        app.toast("PERINGATAN: %s belum punya rute default" % new, "warn", 5)
 
 def network_menu(app):
     def pick_dns(a):
@@ -1952,7 +2546,10 @@ def network_menu(app):
         a.push(chooser(a, "DNS untuk klien", opts, cur, lambda v: set_cfg(a, "dns", list(v))))
 
     def pick_up(a):
-        opts = [("auto (ikuti rute default)", "auto")] + [(n, n) for n in list_ifaces()]
+        ap = a.hs.ap or a.hs.ap_iface()
+        excluded = ("docker", "veth", "br-", "virbr", "tun", "tap")
+        opts = [("auto (ikuti rute kernel/LTE)", "auto")] + [
+            (n, n) for n in list_ifaces() if n != ap and not n.startswith(excluded)]
         a.push(chooser(a, "Interface upstream", opts, a.cfg["upstream"], lambda v: set_cfg(a, "upstream", v)))
 
     def pick_sub(a):
@@ -1961,12 +2558,13 @@ def network_menu(app):
     return MenuScreen("Jaringan", lambda a: [
         Item("Interface upstream", pick_up, value=lambda a: a.cfg["upstream"]),
         Item("Bagikan internet (NAT)", lambda a: toggle(a, "nat"), value=lambda a: "ON" if a.cfg["nat"] else "OFF"),
-        Item("Pindah upstream wlan0 ↔ rmnet_ipa0", lambda a: switch_upstream(a), value=lambda a: a.cfg["upstream"]),
+        Item("Pindah upstream berikutnya", lambda a: switch_upstream(a), value=lambda a: a.cfg["upstream"]),
         Item("DNS klien", pick_dns, value=lambda a: a.cfg["dns"][0]),
         Item("Subnet hotspot", pick_sub, value=lambda a: a.cfg["subnet"]),
         Item("Tes ping internet", ping_test),
-        Item("Refresh wlan0 (scan ulang)", refresh_wlan0),
-        Item("Sambungkan wlan0 ke WiFi lain", connect_wlan0),
+        Item("Scan ulang Wi-Fi", refresh_wifi),
+        Item("Tambah upstream Wi-Fi (wizard)", connect_wifi),
+        Item("Atur LTE sebagai backup", configure_lte_backup),
         Item("Daftar interface", show_ifaces),
     ])
 
@@ -1986,7 +2584,7 @@ def wifi_menu(app):
         a.push(chooser(a, "Maks. klien", [("%d klien" % n, n) for n in (1, 2, 4, 8, 16, 32)], a.cfg["max_clients"], lambda v: set_cfg(a, "max_clients", v)))
 
     def pick_wlan(a):
-        opts = [("auto", "auto")] + [(n, n) for n in list_ifaces() if is_wifi(n) or a.demo]
+        opts = [("auto", "auto")] + [(n, n) for n in (["wlan0"] if a.demo else wifi_ifaces())]
         a.push(chooser(a, "Interface WiFi", opts, a.cfg["wlan"], lambda v: set_cfg(a, "wlan", v)))
 
     return MenuScreen("Pengaturan Hotspot", lambda a: [
@@ -2108,6 +2706,7 @@ class App:
         self.display = Display(self.demo)
         self.hs = Hotspot(self)
         self.stats = Stats(self)
+        self.upstream_monitor = UpstreamMonitor(self)
         self.buttons = None
         self.last_input = time.time()
         self.top_margin = 4
@@ -2402,6 +3001,7 @@ class App:
         self.buttons = Buttons(self.q, grab=not self.args.no_grab)
         self.buttons.start()
         self.stats.start()
+        self.upstream_monitor.start()
         self.log("%s v%s mulai%s" % ("POCO-TUI", VERSION, " (mode demo)" if self.demo else ""))
         if self.demo:
             self.log("Mode demo: tidak ada perubahan pada sistem")
@@ -2455,6 +3055,9 @@ class App:
         scr.refresh()
 
     def shutdown(self):
+        self.upstream_monitor.stop_event.set()
+        if self.upstream_monitor.is_alive():
+            self.upstream_monitor.join(1.0)
         if self.buttons:
             self.buttons.stop_flag = True
             self.buttons.join(1.0)
