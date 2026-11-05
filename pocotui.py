@@ -1029,7 +1029,6 @@ class UpstreamMonitor(threading.Thread):
         self.last_wifi_state = None
         self.lte_active = None
         self.last_route_error = None
-        self.last_radio_attempt = 0.0
         self.last_radio_warning = None
         self.last_lte_error = None
 
@@ -2129,7 +2128,9 @@ def toggle_wifi_bssid_lock(app):
     enabled = not app.cfg["wifi_lock_bssid"]
 
     def apply():
-        if not app.demo and which("nmcli"):
+        if not app.demo:
+            if not which("nmcli"):
+                raise RuntimeError("mengubah kunci BSSID memerlukan NetworkManager/nmcli")
             phy = app.hs.phy_iface()
             if phy:
                 rc, link = sh(["iw", "dev", phy, "link"], timeout=4)
@@ -2143,11 +2144,25 @@ def toggle_wifi_bssid_lock(app):
                                      "802-11-wireless.bssid", value], timeout=8)
                     if rc:
                         raise RuntimeError(output[-100:] or "gagal mengubah kunci BSSID")
+                elif enabled and "Not connected." not in link:
+                    raise RuntimeError("BSSID aktif tidak dapat dibaca; pengaturan tidak diubah")
         app.cfg["wifi_lock_bssid"] = enabled
         app.cfg.save()
 
     app.job("Mengubah kunci BSSID", apply,
             then=lambda _: app.toast("Kunci BSSID %s" % ("aktif" if enabled else "dilepas"), "good"))
+
+
+def smart_wifi_choice(networks, traffic_rate):
+    if not networks:
+        return None, None
+    strongest = max(networks, key=lambda record: (record[2], record[0].lower()))
+    current = next((record for record in networks if record[4]), None)
+    if current and traffic_rate >= 128 * 1024:
+        return current, "traffic aktif"
+    if current and current[2] >= strongest[2] - 15:
+        return current, "sinyal masih dalam ambang stabil"
+    return strongest, None
 
 
 def connect_wifi(app):
@@ -2192,7 +2207,9 @@ def connect_wifi(app):
                 by_ssid[fields[1]] = record
         return phy, sorted(by_ssid.values(), key=lambda row: (-row[2], row[0].lower()))
 
-    def connect_selected(phy, ssid, security, password="", hidden=False):
+    def connect_selected(phy, ssid, security, password="", hidden=False, bssid=""):
+        target_bssid = bssid
+
         def fn():
             try:
                 if app.demo:
@@ -2204,6 +2221,8 @@ def connect_wifi(app):
                     cmd += ["ifname", phy]
                     if hidden:
                         cmd += ["hidden", "yes"]
+                    if target_bssid:
+                        cmd += ["bssid", target_bssid]
                     rc, out = sh(cmd, timeout=35)
                     if rc:
                         raise RuntimeError(out[-120:] or "gagal menyambungkan Wi-Fi")
@@ -2215,9 +2234,9 @@ def connect_wifi(app):
                                     "ipv4.route-metric", "100", "ipv6.route-metric", "100"]
                     if app.cfg["wifi_lock_bssid"]:
                         _, link = sh(["iw", "dev", phy, "link"], timeout=4)
-                        bssid = re.search(r"Connected to\s+([0-9a-fA-F:]{17})", link)
-                        if bssid:
-                            profile_args += ["802-11-wireless.bssid", bssid.group(1).lower()]
+                        active_bssid = re.search(r"Connected to\s+([0-9a-fA-F:]{17})", link)
+                        if active_bssid:
+                            profile_args += ["802-11-wireless.bssid", active_bssid.group(1).lower()]
                         else:
                             app.log("PERINGATAN: Wi-Fi tersambung, tetapi BSSID aktif tidak dapat dikunci")
                     else:
@@ -2268,31 +2287,28 @@ def connect_wifi(app):
                                     lambda text: None if 1 <= len(text.encode("utf-8")) <= 32 else "SSID harus 1-32 byte",
                                     32, on_cancel=restore_hotspot))
             elif value == "__auto_best__":
-                current = next((record for record in networks if record[4]), None)
-                strongest = max(networks, key=lambda record: (record[2], record[0].lower()))
-                if current and traffic_at_start >= 128 * 1024:
-                    keep_current(current, "traffic aktif")
-                elif current and current[2] >= strongest[2] - 15:
-                    keep_current(current, "sinyal masih dalam ambang stabil")
+                choice, reason = smart_wifi_choice(networks, traffic_at_start)
+                if reason:
+                    keep_current(choice, reason)
                 else:
-                    choose_security(phy, strongest[0], strongest[1])
+                    choose_security(phy, choice[0], choice[1], bssid=choice[3])
             else:
-                choose_security(phy, value[0], value[1])
+                choose_security(phy, value[0], value[1], bssid=value[3])
 
         if not networks:
             app.toast("Tidak ada jaringan terdeteksi; pilih SSID tersembunyi", "warn", 5)
         app.push(chooser(app, "Pilih upstream Wi-Fi", options, None, selected,
                          on_back=restore_hotspot))
 
-    def choose_security(phy, ssid, security, hidden=False):
+    def choose_security(phy, ssid, security, hidden=False, bssid=""):
         if not ssid:
             app.toast("SSID tidak boleh kosong", "warn")
             return
         if security in ("", "--", "OPEN"):
-            connect_selected(phy, ssid, security, hidden=hidden)
+            connect_selected(phy, ssid, security, hidden=hidden, bssid=bssid)
             return
         app.push(EditScreen("Sandi Wi-Fi: %s" % ssid, "",
-                            lambda password: connect_selected(phy, ssid, security, password, hidden),
+                            lambda password: connect_selected(phy, ssid, security, password, hidden, bssid),
                             lambda text: None if not text or 8 <= len(text) <= 63 else "Sandi WPA harus 8-63 karakter",
                             63, "Sandi disimpan di profil NetworkManager. Profil diatur auto-connect.",
                             on_cancel=restore_hotspot))
@@ -2897,6 +2913,7 @@ class App:
         self.idle_hotspot_since = None
         self.idle_stop_pending = False
         self.idle_stop_logged = False
+        self.idle_stop_attempted = False
         self.top_margin = 4
         self.scr = None
         self.set_symbols()
@@ -3158,7 +3175,8 @@ class App:
         if self.toast_msg and now > self.toast_msg[2]:
             self.toast_msg = None
         to = self.cfg["screen_timeout"]
-        if to and not self.display.blanked and now - self.last_input > to and not self.busy:
+        if (to and not self.display.blanked and now - self.last_input > to
+                and not self.busy and self.battery_low_since is None):
             self.blank_screen()
         if self.hs.state == "on" and not self.demo and not (self.hs.pid("hostapd") and self.hs.pid("dnsmasq")):
             self.hs.state, self.hs.error = "error", "proses hostapd/dnsmasq berhenti"
@@ -3188,6 +3206,9 @@ class App:
             if self.battery_low_since is None:
                 self.battery_low_since = monotonic_now
                 self.log("baterai <=15% saat discharging; shutdown dibatalkan bila charger terpasang")
+                self.toast("Baterai <=15%; sambungkan charger untuk mencegah shutdown otomatis", "warn", 35)
+                if getattr(getattr(self, "display", None), "blanked", False):
+                    self.wake()
             elif (self.battery_shutdown_deadline is None
                   and monotonic_now - self.battery_low_since >= 30):
                 self.battery_shutdown_deadline = monotonic_now + 30
@@ -3238,21 +3259,24 @@ class App:
             self.idle_hotspot_since = None
             self.idle_stop_pending = False
             self.idle_stop_logged = False
+            self.idle_stop_attempted = False
         elif clients_valid:
             if data.get("clients"):
                 self.idle_hotspot_since = None
                 self.idle_stop_logged = False
+                self.idle_stop_attempted = False
             else:
                 if self.idle_hotspot_since is None:
                     self.idle_hotspot_since = monotonic_now
                     self.log("hotspot idle: mulai hitung 30 menit tanpa klien")
                 elif (monotonic_now - self.idle_hotspot_since >= idle_timeout
-                      and not self.idle_stop_pending):
+                      and not self.idle_stop_pending and not self.idle_stop_attempted):
                     if not self.idle_stop_logged:
                         self.log("hotspot idle 30 menit; mematikan AP")
                         self.idle_stop_logged = True
                     if not self.busy:
                         self.idle_stop_pending = True
+                        self.idle_stop_attempted = True
 
                         def stop_idle_hotspot():
                             try:
@@ -3313,13 +3337,13 @@ class App:
             except queue.Empty:
                 pass
             ch = scr.getch()
+            self.tick()
             if ch != -1 and self.display.blanked:
                 self.last_input = time.time()
                 self.wake()
                 continue
             if ch in keymap:
                 self.dispatch(keymap[ch])
-            self.tick()
             if self.display.blanked:
                 continue
             try:
