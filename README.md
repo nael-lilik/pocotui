@@ -7,6 +7,17 @@ sentuh yang tidak terbaca.
 
 Tanpa dependensi pip: cukup Python 3 (modul `curses` bawaan).
 
+## Kredensial bot Telegram (opsional)
+
+Jika menggunakan `telegram_bot.py`, salin `.env.example` menjadi `.env`, lalu isi
+`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, dan kredensial hotspot/LLM yang diperlukan.
+`OLLAMA_URL`, `OLLAMA_MODEL`, `REMOTE_URL`, dan `LLM_MODEL` mengatur endpoint serta
+model LLM; sesuaikan dengan layanan yang digunakan.
+Jalankan bot dari direktori proyek; `.env` dibaca otomatis dan tidak dilacak Git.
+Batasi akses file dengan `chmod 600 .env`. Jangan membagikan atau meng-commit file ini.
+Jika token atau API key pernah tersimpan di Git, cabut/rotasi kredensial tersebut;
+menghapusnya dari versi terbaru tidak menghapusnya dari riwayat Git.
+
 ## Pasang
 
 ```sh

@@ -1,39 +1,80 @@
 #!/usr/bin/env python3
 """Nura Telegram bot — cyberpunk neon edition."""
-import json, urllib.request, time, os, threading, sys, subprocess
+import json, urllib.request, time, os, threading, sys, subprocess, shlex, tempfile
 
-TOKEN = ""
-HOTSPOT_CONF = "/root/pocotui/hotspot.conf"
-CHAT_ID = ""
-OLLAMA_URL = "http://localhost:11434/api/generate"
-REMOTE_URL = ""
-MODEL = "smart"
-API_KEY = ""
+ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+
+
+def read_env_file():
+    values = {}
+    try:
+        with open(ENV_FILE) as f:
+            for number, line in enumerate(f, 1):
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[7:].lstrip()
+                if "=" not in line:
+                    raise ValueError("%s:%d: expected KEY=VALUE" % (ENV_FILE, number))
+                key, raw_value = line.split("=", 1)
+                key = key.strip()
+                if not key or not (key[0].isalpha() or key[0] == "_") or not all(
+                        c.isalnum() or c == "_" for c in key):
+                    raise ValueError("%s:%d: invalid environment variable name" % (ENV_FILE, number))
+                try:
+                    parts = shlex.split(raw_value, comments=True)
+                except ValueError as e:
+                    raise ValueError("%s:%d: %s" % (ENV_FILE, number, e)) from e
+                if len(parts) > 1:
+                    raise ValueError("%s:%d: quote values containing spaces" % (ENV_FILE, number))
+                values[key] = parts[0] if parts else ""
+    except FileNotFoundError:
+        return values
+    return values
+
+
+def load_env():
+    for key, value in read_env_file().items():
+        os.environ.setdefault(key, value)
+
+
+load_env()
+
+TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
+CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+OLLAMA_URL = os.environ.get("OLLAMA_URL", "")
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "")
+REMOTE_URL = os.environ.get("REMOTE_URL", "")
+MODEL = os.environ.get("LLM_MODEL", "")
 OFFSET = 0
 
 NEON = "⚡"
 
 
 def hotspot_creds():
-    ssid, pw = "NuraHotspot", "nura1234"
+    return os.environ.get("HOTSPOT_SSID", "NuraHotspot"), os.environ.get("HOTSPOT_PASSWORD", "")
+
+
+def write_env_file(updates):
+    values = read_env_file()
+    values.update(updates)
+    content = "".join("%s=%s\n" % (key, shlex.quote(value)) for key, value in values.items())
+    fd, temp_path = tempfile.mkstemp(prefix=".env.", dir=os.path.dirname(ENV_FILE))
     try:
-        with open(HOTSPOT_CONF) as f:
-            for line in f:
-                if "=" in line:
-                    k, v = line.strip().split("=", 1)
-                    if k == "ssid": ssid = v
-                    elif k == "password": pw = v
-    except FileNotFoundError:
-        pass
-    return ssid, pw
+        with os.fdopen(fd, "w") as f:
+            f.write(content)
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, ENV_FILE)
+    finally:
+        if os.path.exists(temp_path):
+            os.unlink(temp_path)
 
 
 def set_hotspot_cred(key, val):
-    ssid, pw = hotspot_creds()
-    if key == "ssid": ssid = val
-    else: pw = val
-    with open(HOTSPOT_CONF, "w") as f:
-        f.write(f"ssid={ssid}\npassword={pw}\n")
+    env_key = {"ssid": "HOTSPOT_SSID", "password": "HOTSPOT_PASSWORD"}[key]
+    write_env_file({env_key: val})
+    os.environ[env_key] = val
 
 
 def tg(method, data=None):
@@ -70,19 +111,24 @@ def system_status():
 
 
 def ask_llm(prompt):
-    try:
-        data = {"model": "llama3.2", "prompt": prompt, "stream": False}
-        req = urllib.request.Request(OLLAMA_URL, data=json.dumps(data).encode(),
-                                    headers={"Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=20) as r:
-            return json.loads(r.read()).get("response", "")
-    except Exception:
-        pass
+    if OLLAMA_URL and OLLAMA_MODEL:
+        try:
+            data = {"model": OLLAMA_MODEL, "prompt": prompt, "stream": False}
+            req = urllib.request.Request(OLLAMA_URL, data=json.dumps(data).encode(),
+                                        headers={"Content-Type": "application/json"})
+            with urllib.request.urlopen(req, timeout=20) as r:
+                return json.loads(r.read()).get("response", "")
+        except Exception:
+            pass
+    if not REMOTE_URL or not MODEL:
+        return "LLM error: configure REMOTE_URL and LLM_MODEL in .env"
+    if not os.environ.get("LLM_API_KEY"):
+        return "LLM error: LLM_API_KEY is not configured in .env"
     try:
         data = {"model": MODEL, "messages": [{"role": "user", "content": prompt}], "stream": False}
         req = urllib.request.Request(REMOTE_URL, data=json.dumps(data).encode(),
                                     headers={"Content-Type": "application/json",
-                                             "Authorization": f"Bearer {API_KEY}",
+                                             "Authorization": f"Bearer {os.environ.get('LLM_API_KEY', '')}",
                                              "User-Agent": "curl/8.0"})
         with urllib.request.urlopen(req, timeout=30) as r:
             return json.loads(r.read())["choices"][0]["message"]["content"]
@@ -95,6 +141,9 @@ def hotspot(on):
     if on:
         if "Hotspot" in active:
             return "🔥 Hotspot already ON"
+        ssid, pw = hotspot_creds()
+        if not ssid or len(ssid.encode("utf-8")) > 32 or len(pw) < 8 or len(pw) > 63:
+            return "Hotspot credentials invalid; use a 1–32 byte HOTSPOT_SSID and an 8–63 character HOTSPOT_PASSWORD in .env"
         src = run("ip route get 1.1.1.1 2>/dev/null | head -1").strip()
         iface = src.split("dev", 1)[1].split()[0] if "dev" in src else "?"
         saved = run("nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null").strip()
@@ -107,8 +156,7 @@ def hotspot(on):
             run(f'printf "%s" "{wifi_conn}" > /tmp/nura_wifi_saved 2>/dev/null || true')
         run("iw dev wlan0 interface add ap0 type __ap 2>/dev/null || true")
         run("ip link set ap0 up 2>/dev/null || true")
-        ssid, pw = hotspot_creds()
-        run(f'nmcli dev wifi hotspot ifname ap0 ssid "{ssid}" password "{pw}" 2>&1 || true')
+        run(["nmcli", "dev", "wifi", "hotspot", "ifname", "ap0", "ssid", ssid, "password", pw])
         run("iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE 2>/dev/null || true")
         run("iptables -A FORWARD -i ap0 -o wlan0 -j ACCEPT 2>/dev/null || true")
         run("iptables -A FORWARD -i wlan0 -o ap0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true")
@@ -205,6 +253,9 @@ def self_check():
 
 def main():
     global OFFSET
+    missing = [key for key, value in (("TELEGRAM_BOT_TOKEN", TOKEN), ("TELEGRAM_CHAT_ID", CHAT_ID)) if not value]
+    if missing:
+        raise SystemExit("Missing required .env setting(s): %s" % ", ".join(missing))
     tg("sendMessage", {"chat_id": CHAT_ID, "text": f"{NEON} Nura bot online {NEON}"})
     threading.Thread(target=self_check, daemon=True).start()
     while True:

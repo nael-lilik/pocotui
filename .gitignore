@@ -3,4 +3,7 @@ __pycache__/
 *.pyo
 .qwen/
 *.tmp
+.env
+.env.*
+!.env.example
 </content>
