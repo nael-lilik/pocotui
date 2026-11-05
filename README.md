@@ -5,7 +5,8 @@ Dashboard terminal interaktif untuk Poco F1 (postmarketOS) yang mengubah HP menj
 Seluruh antarmuka dikontrol hanya dengan **VOL+, VOL−, POWER** — cocok untuk layar
 sentuh yang tidak terbaca.
 
-Tanpa dependensi pip: cukup Python 3 (modul `curses` bawaan).
+POCO-TUI terminal tidak memerlukan dependensi pip tambahan (menggunakan modul `curses` bawaan Python).
+Web dashboard berjalan dengan Streamlit.
 
 ## Kredensial bot Telegram (opsional)
 
@@ -34,7 +35,10 @@ respons `mmcli --location-get` pada `raw_gps_data`, modem sumber, hasil parsing 
 baterai, charging, suhu, upstream, status hotspot, serta jumlah klien. Data lokasi sensitif: gunakan Redis
 lokal/terproteksi, jangan mengekspos port Redis ke internet, dan atur retensi sesuai kebutuhan. Installer
 standar memasang dan mengaktifkan Redis lokal; `--no-packages` melewati pemasangan tersebut. Gangguan Redis
-tidak menghentikan TUI; peringatan dicatat di Log.
+tidak menghentikan TUI; status Log membedakan error pembacaan GPS dan koneksi Redis, mencatat pemulihan,
+dan memakai jeda retry Redis bertingkat sampai maksimum 15 menit. Jika muncul `Connection refused`, pastikan
+service Redis berjalan (`rc-service redis status` di Alpine atau `systemctl status redis-server` di Debian)
+dan `REDIS_URL` menunjuk host/port yang benar.
 Tab **Peta** menampilkan posisi dan sampai 500 titik track terakhir dari sesi saat ini pada grid. Menu
 Monitoring & layanan > GPS > **Peta terminal (lintasan lokal)** juga menyediakan tampilan penuh dan zoom.
 Ini peta jejak lokal, bukan peta jalan: tidak memakai tile, internet, atau layanan peta pihak ketiga.
@@ -47,9 +51,47 @@ menghapusnya dari versi terbaru tidak menghapusnya dari riwayat Git.
 
 ```sh
 sudo ./install.sh                 # paket + program
-sudo ./install.sh --autostart     # + otomatis tampil di layar (tty1) saat boot
+sudo ./install.sh --autostart     # + otomatis tampilkan TUI di layar (tty1) saat boot
 ./pocotui.py --demo               # pratinjau di PC, data simulasi, tidak mengubah sistem
 ```
+
+Jika Streamlit sudah terpasang, installer mengaktifkan service dashboard saat boot secara default
+(`pocotui-dashboard` pada OpenRC atau `pocotui-dashboard.service` pada systemd). Dashboard bind hanya ke
+`127.0.0.1:7890` secara default. Untuk mengakses dari perangkat lain, atur bind publik dengan autentikasi
+dan TLS seperti dijelaskan di bawah, atau gunakan reverse proxy TLS.
+Perintah `--autostart` hanya mengatur TUI terminal, bukan dashboard web. Jika Streamlit belum ada, installer
+menampilkan peringatan dan melewati service dashboard; pasang Streamlit lalu jalankan kembali installer.
+Service dapat dihentikan/dimulai dengan `rc-service pocotui-dashboard stop|start` atau
+`systemctl stop|start pocotui-dashboard.service`.
+
+### Webcam / CCTV portabel
+
+POCO-TUI menyediakan server MJPEG on-demand dari kamera V4L2. Jalankan TUI, lalu pilih
+**Monitoring & layanan > Webcam / CCTV > Jalankan camera stream**. Stream hanya menangkap
+selama ada viewer, mendukung satu viewer, dan tidak merekam otomatis. Tutup viewer untuk
+menghentikan capture; fitur ini dapat memakai baterai dan menaikkan suhu.
+
+Installer memasang FFmpeg; driver kamera dan media pipeline kernel tetap harus mendukung
+capture V4L2. Ketersediaan `/dev/video*` saja tidak menjamin kamera dapat menghasilkan frame.
+Jika viewer menampilkan error, periksa `/run/pocotui/camera.log`; FFmpeg menuliskan kegagalan
+capture di sana.
+
+Default-nya server hanya bind ke `127.0.0.1`. Untuk akses dari jaringan, atur di `.env`:
+
+```dotenv
+CAMERA_HOST=0.0.0.0
+CAMERA_PORT=8090
+CAMERA_PASSWORD=ganti-dengan-password-kuat
+CAMERA_TLS_CERT=/etc/pocotui/dashboard.crt
+CAMERA_TLS_KEY=/etc/pocotui/dashboard.key
+```
+
+Nonaktifkan akses jaringan jika tidak memerlukannya. Bind non-localhost ditolak kecuali
+password kamera dan kedua berkas sertifikat TLS tersedia. Password kamera terpisah dari
+password dashboard; gunakan permission ketat untuk `.env` dan private key. Saat bind ke
+`0.0.0.0`, dashboard memberi tautan viewer melalui alamat gateway hotspot (`192.168.50.1`);
+klien di jaringan lain dapat memakai alamat IP perangkat yang sesuai. Uji jalur kamera
+secara lokal terlebih dahulu sebelum mengandalkannya sebagai CCTV.
 
 Jalankan di perangkat (butuh root): `sudo pocotui-tty` (di layar HP) atau `sudo pocotui` (via SSH;
 tombol fisik tetap terbaca langsung dari `/dev/input`).
@@ -91,7 +133,8 @@ Menu utama diringkas menjadi `Hotspot` (nyala/mati/restart, kredensial, **QR WiF
 `Klien` (kick, blokir, daftar blokir), `Jaringan` (upstream, NAT, DNS, subnet, tes ping, interface),
 `Pengaturan` (WiFi/AP: SSID, sandi, band/channel, negara, klien, kunci BSSID; tampilan/daya: kecerahan, timeout,
 tema, ASCII/Unicode, interval), `Monitoring & layanan` (Snort, Suricata, LTE, GPS, web dashboard),
-`Log`, `Sistem`, dan `Bantuan`. Tekan POWER tahan untuk kembali/menutup menu.
+`Log`, `Sistem`, dan `Bantuan`. Menu Monitoring & layanan juga menyediakan **Webcam / CCTV**. Tekan POWER
+tahan untuk kembali/menutup menu.
 Dasbor memiliki tab **Peta** khusus; halaman Ringkasan juga menampilkan mini-map. Menu Monitoring & layanan
 > GPS menyediakan **Peta terminal** penuh dengan zoom (VOL+ memperbesar, VOL− memperkecil). Semua peta
 menampilkan posisi dan track GPS sesi berjalan pada grid karakter, bersifat lokal (tidak mengunduh peta
@@ -99,7 +142,29 @@ jalan/tile dan tidak mengirim koordinat ke penyedia peta).
 
 Perubahan pengaturan radio berlaku setelah *Restart hotspot* (ada pengingat di layar).
 Menu `Sistem` juga mengatur AP idle (default 30 menit tanpa klien; dapat dinonaktifkan) dan
-shutdown baterai rendah (default aktif pada 15%).
+shutdown baterai rendah (default aktif pada 15%). Di `Tampilan & daya` tersedia profil CPU:
+**Eco** membatasi frekuensi maksimum tiap policy ke sekitar 60% kemampuan policy/cluster dan memilih governor
+hemat daya bila tersedia; **Balanced** mengembalikan governor serta batas awal; **Performance** memilih governor `performance` bila
+tersedia (fallback ke governor dinamis yang didukung) dan melepas pembatas maksimum ke batas kernel. Poco F1
+memiliki cluster efisiensi/performa;
+POCO-TUI mendeteksi policy/frekuensi dari sysfs dan tidak mengasumsikan semua kernel mengekspos delapan core
+dengan cara yang sama. **Eco otomatis saat baterai <=20%** aktif secara default ketika baterai discharging,
+lalu kembali ke profil pilihan saat charger tersambung atau kondisi pulih. Kontrol CPU memerlukan akses tulis
+ke cpufreq (umumnya jalankan TUI sebagai root); jika salah satu policy tidak mendukung governor atau batas
+frekuensi yang diminta, error dicatat dengan nama policy agar status aktual dapat diperiksa.
+
+Web dashboard utama dijalankan dari Menu > Monitoring & layanan > Web dashboard menggunakan **Streamlit**.
+Dashboard read-only menampilkan ringkasan perangkat, klien, route/interface dan throughput, LTE, GPS/map,
+sumber daya, profil CPU, status service, ringkasan nftables, dan status webcam; refresh otomatis tiap 5 detik.
+Dashboard menampilkan koordinat GPS serta data mentah terakhir di Redis, jadi lindungi aksesnya sesuai
+sensitivitas data lokasi.
+
+Default Streamlit bind ke `DASHBOARD_HOST=127.0.0.1` dan port `DASHBOARD_PORT=7890`. Untuk membuka port pada
+semua interface, set `DASHBOARD_HOST=0.0.0.0`, `DASHBOARD_PASSWORD`, `DASHBOARD_TLS_CERT`, dan
+`DASHBOARD_TLS_KEY` di `.env`, lalu restart `pocotui-dashboard`. App meminta password dan koneksi memakai HTTPS.
+Gunakan password unik; sertifikat self-signed perlu dipercaya secara manual pada perangkat klien. Jangan membuat
+aturan firewall yang membuka dashboard ke internet publik. Dashboard memuat koordinat GPS dan data perangkat.
+Alternatifnya, gunakan reverse proxy TLS dengan autentikasi.
 
 ## Cara kerja hotspot
 

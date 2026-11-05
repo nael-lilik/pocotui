@@ -1,7 +1,7 @@
 #!/bin/sh
 # POCO-TUI installer - postmarketOS / Alpine (OpenRC) dan Debian/systemd.
 #
-#   ./install.sh                  pasang paket + program
+#   ./install.sh                  pasang paket + program; dashboard web auto-start
 #   ./install.sh --autostart      ...dan jalankan otomatis di layar (tty1) saat boot
 #   ./install.sh --uninstall      hapus program & kembalikan autostart
 #   ./install.sh --no-packages    lewati pemasangan paket (hanya salin file)
@@ -26,10 +26,25 @@ done
 
 INITTAB=/etc/inittab
 UNIT=/etc/systemd/system/pocotui.service
+DASHBOARD_UNIT=/etc/systemd/system/pocotui-dashboard.service
+DASHBOARD_INIT=/etc/init.d/pocotui-dashboard
 
 if [ "$UNINSTALL" = 1 ]; then
   echo "[*] Menghapus POCO-TUI"
   rm -f "$PREFIX/bin/pocotui" "$PREFIX/bin/pocotui-tty"
+  rm -f "$PREFIX/bin/pocotui.py" "$PREFIX/bin/serve_dashboard.py" \
+    "$PREFIX/bin/dashboard_streamlit.py" "$PREFIX/bin/dashboard.html" \
+    "$PREFIX/bin/pocotui-dashboard" "$PREFIX/bin/pocotui_dashboard.py" \
+    "$PREFIX/bin/camera_stream.py"
+  if [ -f "$DASHBOARD_UNIT" ]; then
+    systemctl disable --now pocotui-dashboard.service 2>/dev/null || true
+    rm -f "$DASHBOARD_UNIT"; systemctl daemon-reload 2>/dev/null || true
+  fi
+  if [ -f "$DASHBOARD_INIT" ]; then
+    rc-service pocotui-dashboard stop 2>/dev/null || true
+    rc-update del pocotui-dashboard default 2>/dev/null || true
+    rm -f "$DASHBOARD_INIT"
+  fi
   if [ -f "$UNIT" ]; then
     systemctl disable --now pocotui.service 2>/dev/null || true
     rm -f "$UNIT"; systemctl daemon-reload 2>/dev/null || true
@@ -46,7 +61,7 @@ fi
 if [ "$PACKAGES" = 1 ]; then
   echo "[1/3] Memasang paket"
   if command -v apk >/dev/null 2>&1; then
-    for p in python3 hostapd dnsmasq iptables iproute2 iw rfkill redis libqrencode-tools \
+    for p in python3 hostapd dnsmasq iptables iproute2 iw rfkill redis ffmpeg libqrencode-tools \
              ncurses-terminfo-base kbd terminus-font; do
       apk add --no-cache "$p" >/dev/null 2>&1 && echo "    + $p" || echo "    ! lewati $p (tidak ada/gagal)"
     done
@@ -56,7 +71,7 @@ if [ "$PACKAGES" = 1 ]; then
     for s in dnsmasq hostapd; do rc-service "$s" stop >/dev/null 2>&1 || true; rc-update del "$s" >/dev/null 2>&1 || true; done
   elif command -v apt-get >/dev/null 2>&1; then
     apt-get update -qq
-    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 hostapd dnsmasq iptables iproute2 iw rfkill redis-server qrencode kbd fonts-terminus
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq python3 hostapd dnsmasq iptables iproute2 iw rfkill redis-server ffmpeg qrencode kbd fonts-terminus
     systemctl unmask hostapd 2>/dev/null || true
     systemctl disable --now hostapd dnsmasq 2>/dev/null || true
     systemctl enable --now redis-server
@@ -71,6 +86,13 @@ fi
 echo "[2/3] Memasang program ke $PREFIX/bin"
 mkdir -p "$PREFIX/bin" /etc/pocotui
 install -m 755 "$DIR/pocotui.py" "$PREFIX/bin/pocotui"
+install -m 644 "$DIR/pocotui.py" "$PREFIX/bin/pocotui.py"
+install -m 644 "$DIR/camera_stream.py" "$PREFIX/bin/camera_stream.py"
+install -m 644 "$DIR/serve_dashboard.py" "$PREFIX/bin/serve_dashboard.py"
+install -m 644 "$DIR/dashboard_streamlit.py" "$PREFIX/bin/dashboard_streamlit.py"
+install -m 644 "$DIR/dashboard.html" "$PREFIX/bin/dashboard.html"
+install -m 755 "$DIR/pocotui_dashboard.py" "$PREFIX/bin/pocotui-dashboard"
+install -m 644 "$DIR/pocotui_dashboard.py" "$PREFIX/bin/pocotui_dashboard.py"
 cat > "$PREFIX/bin/pocotui-tty" <<EOF
 #!/bin/sh
 # Peluncur untuk layar fisik: font besar (layar HP beresolusi tinggi) + terminfo linux
@@ -85,8 +107,61 @@ exec $PREFIX/bin/pocotui "\$@"
 EOF
 chmod 755 "$PREFIX/bin/pocotui-tty"
 
+# --------------------------------------------------------- dashboard service
+echo "[3/4] Mengaktifkan web dashboard saat boot"
+if command -v streamlit >/dev/null 2>&1; then
+  if [ -d /run/systemd/system ] || command -v systemctl >/dev/null 2>&1 && [ ! -f "$INITTAB" ]; then
+    cat > "$DASHBOARD_UNIT" <<EOF
+[Unit]
+Description=POCO-TUI Streamlit web dashboard
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=$PREFIX/bin
+Environment=POCOTUI_CONFIG=/etc/pocotui/config.json
+Environment=PYTHONUNBUFFERED=1
+ExecStart=$PREFIX/bin/pocotui-dashboard
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    systemctl daemon-reload
+    systemctl enable --now pocotui-dashboard.service
+    echo "    systemd: pocotui-dashboard.service aktif (localhost:7890)"
+  elif command -v rc-update >/dev/null 2>&1 && command -v rc-service >/dev/null 2>&1; then
+    cat > "$DASHBOARD_INIT" <<EOF
+#!/sbin/openrc-run
+name="POCO-TUI Streamlit web dashboard"
+description="Read-only local POCO-TUI dashboard"
+command="$PREFIX/bin/pocotui-dashboard"
+command_background="yes"
+pidfile="/run/pocotui-dashboard.pid"
+directory="$PREFIX/bin"
+output_log="/var/log/pocotui-dashboard.log"
+error_log="/var/log/pocotui-dashboard.log"
+
+depend() {
+    need localmount
+    after bootmisc
+}
+EOF
+    chmod 755 "$DASHBOARD_INIT"
+    rc-update add pocotui-dashboard default
+    rc-service pocotui-dashboard start
+    echo "    OpenRC: pocotui-dashboard aktif (localhost:7890)"
+  else
+    echo "    ! init system tidak dikenali; jalankan $PREFIX/bin/pocotui-dashboard secara manual"
+  fi
+else
+  echo "    ! Streamlit belum terpasang; dashboard tidak dapat auto-start."
+  echo "      Pasang Streamlit, lalu jalankan ulang installer untuk mengaktifkan service."
+fi
+
 # ---------------------------------------------------------------- autostart
-echo "[3/3] Autostart"
+echo "[4/4] Autostart POCO-TUI terminal"
 if [ "$AUTOSTART" = 1 ]; then
   if [ -d /run/systemd/system ] || command -v systemctl >/dev/null 2>&1 && [ ! -f "$INITTAB" ]; then
     cat > "$UNIT" <<EOF

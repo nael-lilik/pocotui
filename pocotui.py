@@ -118,6 +118,136 @@ if GPS_REDIS_INTERVAL < 5 or GPS_REDIS_RETENTION_DAYS < 1:
 GPS_ENABLE_LOCK = threading.Lock()
 
 
+def cpu_policy_paths(root="/sys/devices/system/cpu/cpufreq"):
+    paths = sorted(glob.glob(os.path.join(root, "policy[0-9]*")))
+    if not paths:
+        paths = sorted(glob.glob("/sys/devices/system/cpu/cpu[0-9]*/cpufreq"))
+    unique = []
+    seen = set()
+    for path in paths:
+        real = os.path.realpath(path)
+        if real not in seen and os.path.isfile(os.path.join(path, "scaling_max_freq")):
+            unique.append(path)
+            seen.add(real)
+    return unique
+
+
+def cpu_policy_status(root="/sys/devices/system/cpu/cpufreq"):
+    policies = []
+    for path in cpu_policy_paths(root):
+        try:
+            maximum = int(rd(os.path.join(path, "cpuinfo_max_freq")))
+            current = int(rd(os.path.join(path, "scaling_cur_freq")))
+            minimum = int(rd(os.path.join(path, "scaling_min_freq")))
+            limit = int(rd(os.path.join(path, "scaling_max_freq")))
+            cpus = rd(os.path.join(path, "related_cpus"), rd(os.path.join(path, "affected_cpus")))
+            hardware_max_mhz = round(maximum / 1000, 0) if maximum else None
+            policies.append({
+                "name": os.path.basename(path), "cpus": cpus,
+                "current_mhz": round(current / 1000, 0) if current else None,
+                "min_mhz": round(minimum / 1000, 0) if minimum else None,
+                "max_mhz": round(limit / 1000, 0) if limit else None,
+                "hardware_max_mhz": hardware_max_mhz,
+                "governor": rd(os.path.join(path, "scaling_governor")),
+                "cluster": ("performance" if hardware_max_mhz and hardware_max_mhz >= 2200 else
+                            "efficiency" if hardware_max_mhz else "unknown"),
+            })
+        except (OSError, ValueError):
+            continue
+    return policies
+
+
+def apply_cpu_profile(profile, root="/sys/devices/system/cpu/cpufreq", state_path=None):
+    if profile not in ("eco", "balanced", "performance"):
+        raise ValueError("profil CPU tidak dikenal: %s" % profile)
+    paths = cpu_policy_paths(root)
+    if not paths:
+        raise RuntimeError("driver cpufreq tidak menyediakan policy yang dapat dikendalikan")
+    state_path = state_path or os.path.join(RUN, "cpu-policy-original.json")
+    original = {}
+    if os.path.isfile(state_path):
+        try:
+            with open(state_path, encoding="utf-8") as state_file:
+                original = json.load(state_file)
+        except (OSError, ValueError) as error:
+            raise RuntimeError("baseline profil CPU tidak dapat dibaca: %s" % error) from error
+        if not isinstance(original, dict) or not original:
+            raise RuntimeError("baseline profil CPU tidak valid")
+    if not original:
+        for path in paths:
+            original[path] = {
+                "governor": rd(os.path.join(path, "scaling_governor")),
+                "min": rd(os.path.join(path, "scaling_min_freq")),
+                "max": rd(os.path.join(path, "scaling_max_freq")),
+            }
+        os.makedirs(os.path.dirname(state_path), exist_ok=True)
+        temp_path = state_path + ".tmp"
+        with open(temp_path, "w", encoding="utf-8") as state_file:
+            json.dump(original, state_file)
+        os.chmod(temp_path, 0o600)
+        os.replace(temp_path, state_path)
+
+    errors = []
+    for path in paths:
+        policy = os.path.basename(path)
+        governor_path = os.path.join(path, "scaling_governor")
+        minimum_path = os.path.join(path, "scaling_min_freq")
+        maximum_path = os.path.join(path, "scaling_max_freq")
+        available = rd(os.path.join(path, "scaling_available_governors")).split()
+        baseline = original.get(path, {})
+        try:
+            if profile == "balanced":
+                target_max = int(baseline["max"])
+                target_min = int(baseline["min"])
+                target_governor = baseline["governor"]
+                with open(maximum_path, "w", encoding="ascii") as output:
+                    output.write(str(target_max))
+                with open(minimum_path, "w", encoding="ascii") as output:
+                    output.write(str(min(target_min, target_max)))
+                if target_governor and (not available or target_governor in available):
+                    with open(governor_path, "w", encoding="ascii") as output:
+                        output.write(target_governor)
+            else:
+                maximum = int(rd(os.path.join(path, "cpuinfo_max_freq"),
+                                 rd(maximum_path)))
+                minimum = int(rd(minimum_path, "0"))
+                frequencies = [int(value) for value in rd(
+                    os.path.join(path, "scaling_available_frequencies")).split()
+                               if value.isdigit()]
+                if profile == "eco":
+                    cap = int(maximum * 0.6)
+                    target_max = max([freq for freq in frequencies if minimum <= freq <= cap],
+                                     default=min(maximum, max(minimum, cap)))
+                    target_governor = next((name for name in ("powersave", "schedutil", "ondemand")
+                                            if name in available), None)
+                    with open(minimum_path, "w", encoding="ascii") as output:
+                        output.write(str(minimum))
+                    with open(maximum_path, "w", encoding="ascii") as output:
+                        output.write(str(target_max))
+                else:
+                    target_max = maximum
+                    target_governor = next((name for name in ("performance", "schedutil", "ondemand")
+                                            if name in available), None)
+                    with open(maximum_path, "w", encoding="ascii") as output:
+                        output.write(str(target_max))
+                    with open(minimum_path, "w", encoding="ascii") as output:
+                        output.write(str(min(minimum, target_max)))
+                if not target_governor:
+                    raise RuntimeError("tidak ada governor yang didukung")
+                with open(governor_path, "w", encoding="ascii") as output:
+                    output.write(target_governor)
+        except (KeyError, OSError, ValueError, RuntimeError) as error:
+            errors.append("%s: %s" % (policy, error))
+    if errors:
+        raise RuntimeError("gagal mengubah profil CPU: %s" % "; ".join(errors))
+    if profile == "balanced":
+        try:
+            os.remove(state_path)
+        except FileNotFoundError:
+            pass
+    return cpu_policy_status(root)
+
+
 def parse_nmea_coordinate(value, hemisphere, degree_digits):
     if not value or hemisphere not in ("N", "S", "E", "W"):
         return None
@@ -241,6 +371,11 @@ def redis_read_reply(sock):
         raise RuntimeError("Redis: %s" % value.decode("utf-8", "replace"))
     if marker == b":":
         return int(value)
+    if marker == b"*":
+        length = int(value)
+        if length == -1:
+            return None
+        return [redis_read_reply(sock) for _ in range(length)]
     if marker == b"$":
         length = int(value)
         if length == -1:
@@ -349,28 +484,43 @@ class GPSRecorder(threading.Thread):
         super().__init__(daemon=True, name="gps-redis-recorder")
         self.app = app
         self.stop_event = threading.Event()
-        self.last_error_log = -300.0
+        self.last_error_signature = None
+        self.last_error_log = 0.0
+        self.redis_retry_after = 0.0
+        self.redis_retry_delay = GPS_REDIS_INTERVAL
         self.last_saved = None
         self.state = "menunggu fix GPS"
         self.track = collections.deque(maxlen=500)
         self.track_lock = threading.Lock()
 
+    def report_error(self, category, error):
+        now = time.monotonic()
+        signature = (category, str(error))
+        if signature != self.last_error_signature or now - self.last_error_log >= 900:
+            hint = ""
+            if category == "Redis" and isinstance(error, ConnectionRefusedError):
+                hint = " (pastikan Redis berjalan dan REDIS_URL benar)"
+            self.app.log("PERINGATAN %s GPS: %s%s" % (category, error, hint))
+            self.last_error_signature = signature
+            self.last_error_log = now
+
     def run(self):
         while not self.stop_event.is_set():
+            phase = "GPS"
             try:
                 rc, output = fetch_modem_gps(self.app)
                 if rc:
                     self.state = "GPS tidak tersedia"
-                    now = time.monotonic()
-                    if now - self.last_error_log >= 300:
-                        self.app.log("PERINGATAN pembacaan GPS: %s" % (output or "ModemManager gagal"))
-                        self.last_error_log = now
+                    self.report_error("GPS", output or "ModemManager gagal")
                     self.stop_event.wait(GPS_REDIS_INTERVAL)
                     continue
                 if not output.strip():
                     self.state = "menunggu data GPS"
                     self.stop_event.wait(GPS_REDIS_INTERVAL)
                     continue
+                if self.last_error_signature and self.last_error_signature[0] == "GPS":
+                    self.app.log("GPS pulih; pembacaan data berhasil")
+                    self.last_error_signature = None
                 location = parse_gps_nmea(output)
                 stats = dict(self.app.stats.d or {})
                 battery = stats.get("bat") or {}
@@ -395,17 +545,31 @@ class GPSRecorder(threading.Thread):
                     "client_count": len(stats.get("clients") or []),
                 }
                 if REDIS_URL:
-                    save_gps_record(REDIS_URL, record, GPS_REDIS_RETENTION_DAYS)
-                    self.last_saved = time.time()
-                    self.state = ("tersimpan di Redis" if location else "data mentah tersimpan; menunggu fix")
+                    if time.monotonic() < self.redis_retry_after:
+                        remaining = max(1, int(self.redis_retry_after - time.monotonic()))
+                        self.state = "Redis gagal; mencoba lagi %ds" % remaining
+                    else:
+                        phase = "Redis"
+                        try:
+                            save_gps_record(REDIS_URL, record, GPS_REDIS_RETENTION_DAYS)
+                        except Exception as error:
+                            self.state = "Redis tidak tersedia: %s" % str(error)[:60]
+                            self.report_error("Redis", error)
+                            self.redis_retry_after = time.monotonic() + self.redis_retry_delay
+                            self.redis_retry_delay = min(900, max(GPS_REDIS_INTERVAL, self.redis_retry_delay * 2))
+                        else:
+                            self.last_saved = time.time()
+                            self.redis_retry_after = 0.0
+                            self.redis_retry_delay = GPS_REDIS_INTERVAL
+                            if self.last_error_signature and self.last_error_signature[0] == "Redis":
+                                self.app.log("Redis GPS pulih; data berhasil disimpan")
+                                self.last_error_signature = None
+                            self.state = ("tersimpan di Redis" if location else "data mentah tersimpan; menunggu fix")
                 else:
                     self.state = "track lokal" if location else "menunggu fix GPS"
             except Exception as error:
-                self.state = "Redis/GPS tidak tersedia"
-                now = time.monotonic()
-                if now - self.last_error_log >= 300:
-                    self.app.log("PERINGATAN penyimpanan GPS Redis: %s" % error)
-                    self.last_error_log = now
+                self.state = "%s tidak tersedia: %s" % (phase, str(error)[:60])
+                self.report_error(phase, error)
             self.stop_event.wait(GPS_REDIS_INTERVAL)
 
 
@@ -557,6 +721,7 @@ DEFAULTS = dict(
     virtual_ap=True, ap_name="ap0",     # AP di interface virtual; wlan0 tetap bebas
     lte_profile="",
     wifi_lock_bssid=True, idle_hotspot_timeout=1800, low_battery_shutdown=True,
+    cpu_profile="balanced", auto_eco_battery=True,
 )
 
 
@@ -2360,6 +2525,16 @@ def toggle(app, key, note=True):
     set_cfg(app, key, not app.cfg[key], note)
 
 
+def choose_cpu_profile(app):
+    profiles = [
+        ("Eco — batas frekuensi ±60%", "eco"),
+        ("Balanced — pulihkan konfigurasi awal", "balanced"),
+        ("Performance — governor performa", "performance"),
+    ]
+    app.push(chooser(app, "Profil CPU", profiles, app.cfg["cpu_profile"],
+                     lambda profile: app.request_cpu_profile(profile, persist=True)))
+
+
 def client_action(app, mac, what):
     ap = app.hs.ap or "wlan0"
 
@@ -2959,31 +3134,237 @@ def gps_menu(app):
     return MenuScreen("GPS", build)
 
 def dashboard_menu(app):
-    def is_running():
-        rc, _ = sh("pgrep -f dashboard_streamlit.py", timeout=2)
-        if rc == 0:
-            return True
-        rc, _ = sh("pgrep -f serve_dashboard.py", timeout=2)
-        if rc == 0:
-            return True
-        rc, _ = sh("pgrep -f app.py", timeout=2)
-        if rc == 0:
-            return True
-        return False
+    pid_path = os.path.join("/tmp", "pocotui-web-dashboard-%d.pid" % os.getuid())
+    port = os.environ.get("DASHBOARD_PORT", "7890")
+    host = os.environ.get("DASHBOARD_HOST", "127.0.0.1")
+    systemd_unit = "/etc/systemd/system/pocotui-dashboard.service"
+    openrc_service = "/etc/init.d/pocotui-dashboard"
+
+    def service_manager():
+        if os.path.isfile(systemd_unit) and which("systemctl"):
+            return "systemctl"
+        if os.path.isfile(openrc_service) and which("rc-service"):
+            return "rc-service"
+        return None
+
+    def dashboard_pid():
+        try:
+            pid = int(rd(pid_path))
+            command_line = rd("/proc/%d/cmdline" % pid)
+            if "dashboard_streamlit.py" in command_line:
+                return pid
+        except (OSError, ValueError):
+            pass
+        try:
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                command_line = rd("/proc/%s/cmdline" % entry)
+                if "streamlit" in command_line and "dashboard_streamlit.py" in command_line:
+                    return int(entry)
+        except OSError:
+            pass
+        return None
+
+    def start(a):
+        if dashboard_pid():
+            a.toast("Web dashboard sudah berjalan", "info")
+            return
+        try:
+            address = ipaddress.ip_address(host)
+            local_only = address.is_loopback
+        except ValueError:
+            local_only = host.lower() == "localhost"
+        if not local_only and not (
+                os.environ.get("DASHBOARD_PASSWORD")
+                and os.environ.get("DASHBOARD_TLS_CERT")
+                and os.environ.get("DASHBOARD_TLS_KEY")):
+            a.toast("Akses jaringan memerlukan password dan sertifikat TLS di .env", "bad", 8)
+            return
+        manager = service_manager()
+        if manager:
+            service = ["systemctl", "start", "pocotui-dashboard.service"] if manager == "systemctl" else [
+                "rc-service", "pocotui-dashboard", "start"]
+
+            def start_service():
+                rc, output = sh(service, timeout=15)
+                if rc:
+                    raise RuntimeError(output.strip() or "gagal menjalankan service dashboard")
+
+            a.job("Menyalakan service web dashboard", start_service,
+                  then=lambda _: a.toast("Dashboard aktif di port %s" % port, "good"))
+            return
+        if not which("streamlit"):
+            a.toast("Streamlit tidak ditemukan; pasang dependency dashboard", "bad", 8)
+            return
+        script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pocotui_dashboard.py")
+        log_path = os.path.join(RUN, "dashboard.log")
+
+        def launch():
+            log_file = open(log_path, "a", encoding="utf-8")
+            env = os.environ.copy()
+            env["POCOTUI_CONFIG"] = a.cfg.path
+            try:
+                process = subprocess.Popen(
+                    [sys.executable, script],
+                    stdin=subprocess.DEVNULL, stdout=log_file, stderr=subprocess.STDOUT,
+                    start_new_session=True, close_fds=True, env=env,
+                    cwd=os.path.dirname(script))
+            finally:
+                log_file.close()
+            time.sleep(0.3)
+            if process.poll() is not None:
+                raise RuntimeError("dashboard gagal start; periksa %s" % log_path)
+            with open(pid_path, "w", encoding="ascii") as pid_file:
+                pid_file.write(str(process.pid))
+
+        a.job("Menyalakan web dashboard", launch,
+              then=lambda _: a.toast("Dashboard aktif di port %s" % port, "good"))
+
+    def stop(a):
+        pid = dashboard_pid()
+        if not pid:
+            a.toast("Proses dashboard tidak ditemukan", "warn")
+            return
+        manager = service_manager()
+        if manager:
+            service = ["systemctl", "stop", "pocotui-dashboard.service"] if manager == "systemctl" else [
+                "rc-service", "pocotui-dashboard", "stop"]
+
+            def stop_service():
+                rc, output = sh(service, timeout=15)
+                if rc:
+                    raise RuntimeError(output.strip() or "gagal menghentikan service dashboard")
+
+            a.job("Menghentikan service web dashboard", stop_service,
+                  then=lambda _: a.toast("Dashboard dihentikan", "good"))
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            a.toast("Dashboard sudah berhenti", "warn")
+        except PermissionError as error:
+            a.toast("Tidak bisa menghentikan dashboard: %s" % error, "bad", 6)
+        else:
+            try:
+                os.remove(pid_path)
+            except FileNotFoundError:
+                pass
+            a.toast("Dashboard dihentikan", "good")
 
     def build(a):
-        running = is_running()
+        running = bool(dashboard_pid())
+        address = host if host in ("127.0.0.1", "::1", "localhost") else "<IP-perangkat>"
         items = [
             Item("Status", lambda a: None, value=lambda a: "berjalan" if running else "mati"),
-            Item("Port", lambda a: None, value=lambda a: "7890"),
+            Item("Port", lambda a: None, value=lambda a: port),
         ]
         if running:
-            items.append(Item("Hentikan dashboard", lambda a: (sh("pkill -f dashboard_streamlit.py"), sh("pkill -f serve_dashboard.py"), sh("pkill -f app.py")), value=""))
+            items.append(Item("Hentikan dashboard", stop, value=""))
         else:
-            items.append(Item("Jalankan Streamlit", lambda a: sh("nohup streamlit run /root/pocotui/dashboard_streamlit.py --server.port 7890 --server.address 0.0.0.0 >/dev/null 2>&1 &", timeout=3), value=""))
-        items.append(Item("URL", lambda a: None, value=lambda a: "http://<ip>:7890/"))
+            items.append(Item("Jalankan dashboard", start, value=""))
+        scheme = "https" if os.environ.get("DASHBOARD_TLS_CERT") else "http"
+        items.append(Item("Alamat", lambda a: None, value=lambda a: "%s://%s:%s" % (scheme, address, port)))
+        items.append(Item("Info akses", lambda a: a.push(TextView(
+            "Akses web dashboard",
+            ["", "  Bind: %s" % host, "  Port: %s" % port,
+             "  Akses jaringan memakai HTTPS + password dashboard.",
+             "  Self-signed certificate mungkin perlu dipercaya pada klien.",
+             "  Log: %s" % os.path.join(RUN, "dashboard.log")]))))
         return items
     return MenuScreen("Web Dashboard", build)
+
+
+def camera_menu(app):
+    pid_path = os.path.join(RUN, "camera.pid")
+    host = os.environ.get("CAMERA_HOST", "127.0.0.1")
+    port = os.environ.get("CAMERA_PORT", "8090")
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "camera_stream.py")
+
+    def camera_pid():
+        try:
+            pid = int(rd(pid_path))
+            command_line = rd("/proc/%d/cmdline" % pid)
+            return pid if "camera_stream.py" in command_line else None
+        except (OSError, ValueError):
+            return None
+
+    def start(a):
+        if camera_pid():
+            a.toast("Camera stream sudah berjalan", "info")
+            return
+        try:
+            address = ipaddress.ip_address(host)
+            local_only = address.is_loopback
+        except ValueError:
+            local_only = host.lower() == "localhost"
+        if not local_only and not (
+                os.environ.get("CAMERA_PASSWORD")
+                and os.environ.get("CAMERA_TLS_CERT")
+                and os.environ.get("CAMERA_TLS_KEY")):
+            a.toast("Akses kamera jaringan perlu password dan TLS di .env", "bad", 8)
+            return
+        if not which("ffmpeg"):
+            a.toast("ffmpeg tidak ditemukan; pasang ffmpeg untuk kamera", "bad", 8)
+            return
+
+        def launch():
+            env = os.environ.copy()
+            env["CAMERA_PID_FILE"] = pid_path
+            with open(os.path.join(RUN, "camera.log"), "a", encoding="utf-8") as log_file:
+                process = subprocess.Popen(
+                    [sys.executable, script], stdin=subprocess.DEVNULL,
+                    stdout=log_file, stderr=subprocess.STDOUT,
+                    start_new_session=True, close_fds=True, env=env,
+                    cwd=os.path.dirname(script))
+            time.sleep(0.3)
+            if process.poll() is not None:
+                raise RuntimeError("camera server gagal start; periksa %s" % os.path.join(RUN, "camera.log"))
+
+        a.job("Menyalakan camera stream", launch,
+              then=lambda _: a.toast("Camera stream aktif di port %s" % port, "good"))
+
+    def stop(a):
+        pid = camera_pid()
+        if not pid:
+            a.toast("Proses camera stream tidak ditemukan", "warn")
+            return
+        try:
+            os.kill(pid, signal.SIGTERM)
+        except ProcessLookupError:
+            a.toast("Camera stream sudah berhenti", "warn")
+        except PermissionError as error:
+            a.toast("Tidak bisa menghentikan camera stream: %s" % error, "bad", 6)
+        else:
+            a.toast("Camera stream dihentikan", "good")
+
+    def build(a):
+        running = bool(camera_pid())
+        display_host = host if host in ("127.0.0.1", "::1", "localhost") else "<IP-perangkat>"
+        scheme = "https" if os.environ.get("CAMERA_TLS_CERT") else "http"
+        items = [
+            Item("Status server", lambda a: None, value=lambda a: "berjalan" if running else "mati"),
+            Item("Device V4L2", lambda a: None, value=lambda a: os.environ.get("CAMERA_DEVICE", "/dev/video0")),
+            Item("Port", lambda a: None, value=lambda a: port),
+        ]
+        if running:
+            items.append(Item("Hentikan camera stream", stop, value=""))
+        else:
+            items.append(Item("Jalankan camera stream", start, value=""))
+        items.append(Item("Alamat viewer", lambda a: None,
+                          value=lambda a: "%s://%s:%s" % (scheme, display_host, port)))
+        items.append(Item("Info kamera", lambda a: a.push(TextView(
+            "Webcam / CCTV portabel",
+            ["", "  Video MJPEG on-demand; tidak merekam otomatis.",
+             "  Viewer: %s://%s:%s/" % (scheme, display_host, port),
+             "  Hanya satu viewer aktif; ffmpeg berhenti saat viewer tutup.",
+             "  Kamera memakai baterai dan dapat menjadi panas.",
+             "  Kamera V4L2 dan ffmpeg harus tersedia.",
+             "  Akses non-localhost wajib password + HTTPS.",
+             "  Log: %s" % os.path.join(RUN, "camera.log")]))))
+        return items
+
+    return MenuScreen("Webcam / CCTV", build)
 
 
 def settings_menu(app):
@@ -3000,6 +3381,7 @@ def services_menu(app):
         Item("LTE", lambda a: a.push(lte_menu(a))),
         Item("GPS", lambda a: a.push(gps_menu(a))),
         Item("Web dashboard", lambda a: a.push(dashboard_menu(a))),
+        Item("Webcam / CCTV", lambda a: a.push(camera_menu(a))),
     ])
 
 
@@ -3199,6 +3581,7 @@ def display_menu(app):
     return MenuScreen("Tampilan & Daya", lambda a: [
         Item("Kecerahan", pick_br, value=lambda a: "%d%%" % a.cfg["brightness"]),
         Item("Layar mati otomatis", pick_to, value=lambda a: "off" if not a.cfg["screen_timeout"] else "%ds" % a.cfg["screen_timeout"]),
+        Item("Profil CPU", choose_cpu_profile, value=lambda a: a.cfg["cpu_profile"].upper()),
         Item("Matikan layar sekarang", tmo),
         Item("Tema warna", pick_theme, value=lambda a: a.cfg["theme"]),
         Item("Karakter", tog_ascii, value=lambda a: "ASCII" if a.cfg["ascii"] else "Unicode"),
@@ -3240,6 +3623,8 @@ def system_menu(app):
              value=lambda a: "OFF" if not a.cfg["idle_hotspot_timeout"] else "30 menit"),
         Item("Shutdown baterai <=15%", lambda a: toggle(a, "low_battery_shutdown", False),
              value=lambda a: "ON" if a.cfg["low_battery_shutdown"] else "OFF"),
+        Item("Eco otomatis saat baterai <=20%", lambda a: toggle(a, "auto_eco_battery", False),
+             value=lambda a: "ON" if a.cfg["auto_eco_battery"] else "OFF"),
         Item("Info perangkat", device_info),
         Item("Keluar TUI (hotspot tetap jalan)", quit_keep),
         Item("Matikan hotspot lalu keluar", lambda a: confirm(a, "Matikan hotspot & keluar?", lambda: quit_all(a))),
@@ -3295,6 +3680,11 @@ class App:
         self.idle_stop_pending = False
         self.idle_stop_logged = False
         self.idle_stop_attempted = False
+        cpu_state_path = os.path.join(RUN, "cpu-policy-original.json")
+        self.cpu_profile_applied = ("balanced" if self.cfg["cpu_profile"] == "balanced"
+                                    and not os.path.isfile(cpu_state_path) else None)
+        self.cpu_profile_pending = None
+        self.cpu_profile_retry_after = 0.0
         self.top_margin = 4
         self.scr = None
         self.set_symbols()
@@ -3350,6 +3740,44 @@ class App:
                     self.toast("Selesai: %s" % label, "good")
             self.post(fin)
         threading.Thread(target=run, daemon=True).start()
+
+    def request_cpu_profile(self, profile, persist=False, reason=""):
+        if self.cpu_profile_pending or self.busy:
+            if persist:
+                self.toast("CPU belum bisa diubah: %s" % (self.busy or "perubahan sedang berjalan"), "warn")
+            return
+        if not persist and time.monotonic() < self.cpu_profile_retry_after:
+            return
+        if profile == self.cpu_profile_applied:
+            if persist and self.cfg["cpu_profile"] != profile:
+                self.cfg["cpu_profile"] = profile
+                self.cfg.save()
+            return
+        self.cpu_profile_pending = profile
+
+        def apply():
+            try:
+                policies = apply_cpu_profile(profile)
+                if persist:
+                    self.cfg["cpu_profile"] = profile
+                    self.cfg.save()
+                return policies
+            except Exception:
+                self.cpu_profile_pending = None
+                self.cpu_profile_retry_after = time.monotonic() + 300
+                raise
+
+        def completed(policies):
+            self.cpu_profile_applied = profile
+            self.cpu_profile_pending = None
+            self.cpu_profile_retry_after = 0.0
+            maxima = [policy["max_mhz"] for policy in policies if policy.get("max_mhz")]
+            detail = " · max %s MHz" % max(maxima) if maxima else ""
+            message = "Profil CPU %s aktif%s" % (profile.upper(), detail)
+            self.log(message + ((" (%s)" % reason) if reason else ""))
+            self.toast(message, "good", 5)
+
+        self.job("Mengubah profil CPU ke %s" % profile.upper(), apply, then=completed)
 
     def blank_screen(self):
         self.display.blank(True, self.cfg["brightness"])
@@ -3565,6 +3993,23 @@ class App:
             self.toast("Hotspot berhenti tiba-tiba!", "bad", 8)
             self.wake()
         self.update_safety_automations()
+        self.update_cpu_power_profile()
+
+    def update_cpu_power_profile(self):
+        data = self.stats.d or {}
+        sample_time = data.get("ts")
+        fresh = (isinstance(sample_time, (int, float))
+                 and 0 <= time.time() - sample_time <= max(15, self.cfg["refresh"] * 4))
+        battery = data.get("bat") or {}
+        eco = (self.cfg["auto_eco_battery"] and fresh
+               and isinstance(battery.get("pct"), (int, float))
+               and battery["pct"] <= 20
+               and str(battery.get("status", "")).strip().lower() == "discharging"
+               and not data.get("charger", False))
+        desired = "eco" if eco else self.cfg["cpu_profile"]
+        if desired != self.cpu_profile_applied and self.cpu_profile_pending is None and not self.busy:
+            reason = "baterai <=20% dan discharging" if eco else "kondisi baterai normal"
+            self.request_cpu_profile(desired, reason=reason)
 
     def update_safety_automations(self):
         if self.demo:
@@ -3705,6 +4150,9 @@ class App:
             self.log("Tombol evdev tidak ditemukan - pakai keyboard")
         if self.cfg["autostart"] and self.hs.state == "off":
             start_hotspot(self)
+        if (self.cfg["cpu_profile"] != "balanced"
+                or os.path.isfile(os.path.join(RUN, "cpu-policy-original.json"))):
+            self.request_cpu_profile(self.cfg["cpu_profile"], reason="profil tersimpan")
         keymap = {curses.KEY_UP: "up", ord("k"): "up", curses.KEY_DOWN: "down", ord("j"): "down",
                   10: "ok", 13: "ok", curses.KEY_ENTER: "ok", ord(" "): "ok", ord("l"): "ok",
                   27: "back", curses.KEY_BACKSPACE: "back", 127: "back", ord("q"): "back",

@@ -2,171 +2,437 @@
 <html lang="id">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<title>POCO-TUI Dashboard</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="theme-color" content="#07111c">
+<title>POCO-TUI · Mobile Gateway</title>
 <style>
-  :root{--bg:#0a0f14;--panel:#111820;--fg:#cdd9e5;--dim:#6b7a8a;--acc:#4fd1c5;--good:#5fd38d;--warn:#f5c542;--bad:#f36b6b;--border:#1f2a36}
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--fg);font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:13px}
-  header{display:flex;justify-content:space-between;align-items:center;padding:10px 14px;border-bottom:1px solid var(--border);background:#0d131a}
-  header .title{color:var(--acc);font-weight:700}
-  header .meta{color:var(--dim);font-size:12px}
-  .tabs{display:flex;gap:4px;padding:8px 14px;border-bottom:1px solid var(--border)}
-  .tab{padding:6px 12px;border:1px solid var(--border);border-radius:6px;cursor:pointer;color:var(--dim);background:#0d131a}
-  .tab.active{color:var(--acc);border-color:var(--acc);background:#0f1b22}
-  main{padding:12px 14px;display:grid;gap:12px}
-  .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
-  @media(max-width:800px){.grid{grid-template-columns:1fr}}
-  .panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
-  .panel h3{margin:0 0 8px;font-size:12px;letter-spacing:1px;color:var(--acc)}
-  .row{display:flex;justify-content:space-between;gap:8px;padding:2px 0;border-bottom:1px dotted #1a2430}
-  .row:last-child{border-bottom:none}
-  .label{color:var(--dim)}
-  .val{color:var(--fg)}
-  .good{color:var(--good)} .warn{color:var(--warn)} .bad{color:var(--bad)}
-  .bar{height:8px;background:#0d131a;border-radius:4px;overflow:hidden;margin:0 6px;flex:1}
-  .bar>div{height:100%;background:var(--acc)}
-  .spark{display:inline-block;vertical-align:middle}
-  .log{height:220px;overflow:auto;background:#080c10;border:1px solid var(--border);border-radius:6px;padding:8px;font-size:11px;white-space:pre-wrap}
-  .footer{padding:8px 14px;color:var(--dim);border-top:1px solid var(--border);font-size:11px}
-  table{width:100%;border-collapse:collapse;font-size:12px}
-  th,td{padding:4px 6px;border-bottom:1px solid #1a2430;text-align:left}
-  th{color:var(--acc)}
+:root {
+  color-scheme: dark;
+  --bg: #07111c; --surface: #0c1926; --surface-2: #102132; --line: #1d3448;
+  --text: #e6f0f7; --muted: #8299ac; --cyan: #51e0d0; --blue: #63a8ff;
+  --green: #67e3a2; --yellow: #ffd166; --red: #ff6d7f; --radius: 18px;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box }
+body { margin: 0; min-height: 100vh; color: var(--text); background:
+  radial-gradient(ellipse at 10% -10%, #12334a 0, transparent 40%),
+  radial-gradient(ellipse at 100% 20%, #102844 0, transparent 35%), var(--bg); }
+button { font: inherit }
+.shell { max-width: 1540px; margin: auto; padding: 22px clamp(14px, 3vw, 42px) 34px }
+.topbar { display:flex; align-items:center; justify-content:space-between; gap:16px; margin-bottom:22px }
+.brand { display:flex; align-items:center; gap:13px }
+.brand-mark { width:46px; height:46px; display:grid; place-items:center; border-radius:15px;
+  color:#04141b; font-size:22px; background:linear-gradient(145deg,var(--cyan),#63a8ff);
+  box-shadow:0 10px 35px #51e0d033 }
+h1 { margin:0; font-size:clamp(20px,3vw,28px); letter-spacing:-.04em }
+.eyebrow,.muted { color:var(--muted) }
+.eyebrow { font-size:11px; font-weight:700; letter-spacing:.15em; text-transform:uppercase }
+.top-meta { display:flex; align-items:center; gap:10px; color:var(--muted); font-size:13px }
+.pill { display:inline-flex; align-items:center; gap:8px; padding:7px 11px; border:1px solid var(--line);
+  border-radius:999px; background:#0b1823; white-space:nowrap }
+.dot { width:8px; height:8px; background:var(--muted); border-radius:50%; box-shadow:0 0 0 4px #8299ac18 }
+.dot.live { background:var(--green); box-shadow:0 0 0 4px #67e3a218 }
+.dot.down { background:var(--red); box-shadow:0 0 0 4px #ff6d7f18 }
+.nav { display:flex; gap:7px; overflow:auto; padding:5px 0 18px; scrollbar-width:thin }
+.nav button { color:var(--muted); border:1px solid transparent; background:transparent; padding:10px 14px;
+  border-radius:12px; cursor:pointer; white-space:nowrap; transition:.2s }
+.nav button:hover { color:var(--text); background:#ffffff0a }
+.nav button.active { color:var(--cyan); border-color:#51e0d044; background:#51e0d012 }
+.page { display:none; animation:appear .24s ease }
+.page.active { display:block }
+@keyframes appear { from {opacity:.5;transform:translateY(4px)} to {opacity:1;transform:none} }
+.grid { display:grid; gap:14px }
+.overview-grid { grid-template-columns:repeat(12,minmax(0,1fr)) }
+.span-3 { grid-column:span 3 }.span-4 { grid-column:span 4 }.span-5 { grid-column:span 5 }
+.span-6 { grid-column:span 6 }.span-7 { grid-column:span 7 }.span-8 { grid-column:span 8 }
+.span-12 { grid-column:span 12 }
+.card { min-width:0; padding:19px; border:1px solid #1c3448; border-radius:var(--radius);
+  background:linear-gradient(145deg,#102133eF,#0a1723f5); box-shadow:0 12px 35px #00000014 }
+.card-head { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; margin-bottom:16px }
+.card h2 { margin:0; font-size:15px; letter-spacing:-.01em }
+.card-sub { margin-top:5px; color:var(--muted); font-size:12px }
+.icon { color:var(--cyan); font-size:18px }
+.metric { min-height:126px; display:flex; flex-direction:column; justify-content:space-between }
+.metric-label { color:var(--muted); font-size:12px }
+.metric-value { margin-top:12px; font-size:clamp(24px,3vw,34px); font-weight:700; letter-spacing:-.05em }
+.metric-foot { color:var(--muted); font-size:12px }
+.good { color:var(--green)!important }.warn { color:var(--yellow)!important }.bad { color:var(--red)!important }
+.hero { position:relative; overflow:hidden; min-height:208px; display:flex; align-items:center;
+  background:linear-gradient(115deg,#102a37,#102239 58%,#152444) }
+.hero:after { content:""; position:absolute; width:270px; height:270px; right:-70px; top:-110px;
+  border:1px solid #51e0d022; border-radius:50%; box-shadow:0 0 0 32px #51e0d009,0 0 0 68px #51e0d007 }
+.hero-content { position:relative; z-index:1; max-width:650px }
+.hero h2 { margin:10px 0 8px; font-size:clamp(28px,5vw,47px); letter-spacing:-.055em }
+.hero p { color:#a5b9c9; margin:0; line-height:1.55 }
+.hero-stats { display:flex; flex-wrap:wrap; gap:9px; margin-top:20px }
+.hero-stats .pill { font-size:12px }
+.bar { height:6px; overflow:hidden; margin-top:13px; border-radius:20px; background:#213546 }
+.bar i { display:block; height:100%; width:0; border-radius:inherit; background:linear-gradient(90deg,var(--cyan),var(--blue)); transition:width .5s }
+.metric.warn-meter .bar i { background:linear-gradient(90deg,var(--yellow),#ff9b54) }
+.metric.bad-meter .bar i { background:linear-gradient(90deg,var(--red),#ff9b54) }
+.split { display:grid; grid-template-columns:1fr 1fr; gap:14px }
+.rows { display:grid; gap:0 }
+.row { display:flex; justify-content:space-between; align-items:center; gap:12px; padding:10px 0;
+  border-bottom:1px solid #ffffff0b; font-size:13px }
+.row:last-child { border-bottom:0 }.row span:first-child { color:var(--muted) }
+.row span:last-child { text-align:right; overflow-wrap:anywhere }
+.chart-wrap { height:205px; position:relative }
+canvas { width:100%; height:100%; display:block }
+.table-wrap { overflow:auto; border:1px solid var(--line); border-radius:12px }
+table { width:100%; border-collapse:collapse; text-align:left; font-size:13px; white-space:nowrap }
+th,td { padding:12px 14px; border-bottom:1px solid #ffffff0b }
+th { color:var(--muted); font-weight:600; background:#091521; font-size:11px; letter-spacing:.08em; text-transform:uppercase }
+tr:last-child td { border-bottom:0 }
+.empty { padding:30px 14px; color:var(--muted); text-align:center }
+.toolbar { display:flex; align-items:center; justify-content:space-between; gap:12px; margin-bottom:14px }
+.toolbar h2 { margin:0; font-size:20px }
+.button { border:1px solid var(--line); border-radius:10px; padding:9px 13px; color:var(--cyan);
+  background:#102132; cursor:pointer }.button:hover { border-color:var(--cyan) }
+.map-box { min-height:370px; display:grid; place-items:center; overflow:hidden; border:1px solid var(--line);
+  border-radius:14px; background:radial-gradient(ellipse at center,#102637,#08141f 70%) }
+.map-box svg { display:block; width:100%; height:370px }
+.map-grid { stroke:#284157; stroke-width:1; opacity:.5 }
+.map-path { fill:none; stroke:var(--cyan); stroke-width:3; stroke-linecap:round; stroke-linejoin:round;
+  filter:drop-shadow(0 0 5px #51e0d066) }
+.map-point { fill:var(--blue); stroke:#d4edff; stroke-width:2 }
+.map-current { fill:var(--green); stroke:#e9fff4; stroke-width:3; filter:drop-shadow(0 0 8px #67e3a288) }
+.map-legend { display:flex; gap:18px; color:var(--muted); font-size:12px; margin-top:12px }
+.map-note { padding:14px; color:var(--muted); font-size:13px }
+.service-grid { display:grid; grid-template-columns:repeat(3,minmax(0,1fr)); gap:10px }
+.service { display:flex; align-items:center; gap:10px; padding:13px; border:1px solid var(--line); border-radius:12px; background:#0a1722 }
+.service .dot { flex:0 0 auto }.service-name { font-size:13px }.service-state { margin-left:auto; color:var(--muted); font-size:11px }
+pre { max-height:430px; overflow:auto; padding:15px; border:1px solid var(--line); border-radius:12px;
+  color:#b6c8d6; background:#07111a; font:12px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace; white-space:pre-wrap; overflow-wrap:anywhere }
+.footer { display:flex; justify-content:space-between; gap:12px; padding:22px 2px 0; color:var(--muted); font-size:11px }
+.toast { position:fixed; right:20px; bottom:20px; padding:11px 15px; border:1px solid var(--line); border-radius:12px;
+  color:var(--text); background:#102132; opacity:0; transform:translateY(10px); transition:.2s; pointer-events:none }
+.toast.show { opacity:1; transform:none }
+@media(max-width:980px) {
+  .span-3 { grid-column:span 6 }.span-4,.span-5,.span-7,.span-8 { grid-column:span 6 }
+  .span-12 { grid-column:span 12 }.service-grid { grid-template-columns:repeat(2,minmax(0,1fr)) }
+}
+@media(max-width:650px) {
+  .shell { padding:15px 12px 26px }.topbar { align-items:flex-start }
+  .top-meta .last-update { display:none }.brand-mark { width:40px;height:40px }
+  .span-3,.span-4,.span-5,.span-6,.span-7,.span-8,.span-12 { grid-column:span 12 }
+  .metric { min-height:108px }.hero { min-height:190px }.hero:after { right:-180px }
+  .split { grid-template-columns:1fr }.service-grid { grid-template-columns:1fr 1fr }
+  .map-box,.map-box svg { min-height:280px;height:280px }
+}
 </style>
 </head>
 <body>
-<header>
-  <div class="title">POCO-TUI Dashboard</div>
-  <div class="meta" id="clock"></div>
-</header>
-<div class="tabs">
-  <div class="tab active" data-tab="overview">Ringkasan</div>
-  <div class="tab" data-tab="clients">Klien</div>
-  <div class="tab" data-tab="net">Jaringan</div>
-  <div class="tab" data-tab="lte">LTE</div>
-  <div class="tab" data-tab="gps">GPS</div>
-  <div class="tab" data-tab="ids">Snort/Suricata</div>
+<div class="shell">
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-mark">◉</div>
+      <div><div class="eyebrow">POCO F1 · MOBILE EDGE</div><h1>Gateway Control</h1></div>
+    </div>
+    <div class="top-meta">
+      <span class="pill"><i class="dot" id="connectionDot"></i><span id="connectionText">Menghubungkan…</span></span>
+      <span class="last-update" id="lastUpdate">--</span>
+    </div>
+  </header>
+  <nav class="nav" aria-label="Dashboard sections">
+    <button class="active" data-page="overview">◈ Ringkasan</button>
+    <button data-page="clients">♙ Klien</button>
+    <button data-page="network">⌁ Jaringan</button>
+    <button data-page="gps">◎ GPS & Peta</button>
+    <button data-page="system">▦ Sistem</button>
+    <button data-page="security">⬡ Keamanan</button>
+  </nav>
+
+  <main>
+    <section class="page active" id="page-overview">
+      <div class="grid overview-grid">
+        <article class="card hero span-8">
+          <div class="hero-content">
+            <div class="eyebrow">MOBILE HOTSPOT · <span id="heroGateway">GATEWAY</span></div>
+            <h2 id="heroStatus">Memuat status…</h2>
+            <p id="heroDescription">Status hotspot, jaringan upstream, dan kesehatan perangkat secara langsung.</p>
+            <div class="hero-stats">
+              <span class="pill">SSID <b id="heroSsid">—</b></span>
+              <span class="pill">Upstream <b id="heroUpstream">—</b></span>
+              <span class="pill">Klien <b id="heroClients">—</b></span>
+              <span class="pill">CPU <b id="powerProfile">—</b></span>
+            </div>
+          </div>
+        </article>
+        <article class="card metric span-4" id="batteryCard">
+          <div class="metric-label">BATERAI · STATUS DAYA</div><div class="metric-value" id="batteryValue">—</div>
+          <div><div class="metric-foot" id="batteryFoot">Membaca sensor</div><div class="bar"><i id="batteryBar"></i></div></div>
+        </article>
+        <article class="card metric span-3"><div class="metric-label">CPU</div><div class="metric-value" id="cpuValue">—</div><div class="bar"><i id="cpuBar"></i></div><div class="metric-foot" id="cpuFoot">Penggunaan prosesor</div></article>
+        <article class="card metric span-3"><div class="metric-label">MEMORI</div><div class="metric-value" id="memoryValue">—</div><div class="bar"><i id="memoryBar"></i></div><div class="metric-foot" id="memoryFoot">RAM terpakai</div></article>
+        <article class="card metric span-3"><div class="metric-label">SUHU PERANGKAT</div><div class="metric-value" id="temperatureValue">—</div><div class="metric-foot">Sensor thermal tertinggi</div></article>
+        <article class="card metric span-3"><div class="metric-label">UPTIME</div><div class="metric-value" id="uptimeValue">—</div><div class="metric-foot" id="loadFoot">Load average —</div></article>
+
+        <article class="card span-7">
+          <div class="card-head"><div><h2>Aktivitas jaringan</h2><div class="card-sub">RX / TX pada upstream aktif · estimasi rate</div></div><span class="icon">⌁</span></div>
+          <div class="chart-wrap"><canvas id="trafficChart"></canvas></div>
+          <div class="row"><span>Interface upstream</span><span id="activeInterface">—</span></div>
+        </article>
+        <article class="card span-5">
+          <div class="card-head"><div><h2>Kesehatan layanan</h2><div class="card-sub">Status komponen gateway</div></div><span class="icon">◉</span></div>
+          <div class="service-grid" id="serviceGrid"></div>
+        </article>
+        <article class="card span-12">
+          <div class="card-head"><div><h2>Lokasi terkini</h2><div class="card-sub">Peta lokal · tidak memakai tile pihak ketiga</div></div><button class="button" data-open="gps">Buka peta →</button></div>
+          <div class="split">
+            <div class="map-box" id="miniMap"><div class="map-note">Menunggu data GPS dari Redis</div></div>
+            <div><div class="row"><span>Koordinat</span><span id="gpsCoordinates">—</span></div>
+              <div class="row"><span>Akurasi / HDOP</span><span id="gpsAccuracy">—</span></div>
+              <div class="row"><span>Kecepatan</span><span id="gpsSpeed">—</span></div>
+              <div class="row"><span>Waktu fix</span><span id="gpsTimestamp">—</span></div>
+              <div class="row"><span>Redis</span><span id="gpsRedisState">—</span></div></div>
+          </div>
+        </article>
+        <article class="card span-12"><div class="card-head"><div><h2>CPU cluster & power profile</h2><div class="card-sub">Kebijakan scaling aktif · ubah mode dari POCO-TUI</div></div></div><div class="service-grid" id="powerPolicies"></div></article>
+      </div>
+    </section>
+
+    <section class="page" id="page-clients">
+      <div class="toolbar"><div><div class="eyebrow">ACCESS POINT</div><h2>Perangkat terhubung</h2></div><span class="pill" id="clientCountPill">0 klien</span></div>
+      <article class="card"><div class="card-head"><div><h2>Daftar klien aktif</h2><div class="card-sub">Data station hostapd dan DHCP lease</div></div></div>
+        <div class="table-wrap"><table><thead><tr><th>Perangkat</th><th>Alamat IP</th><th>MAC address</th><th>Sinyal</th><th>Durasi</th><th>RX</th><th>TX</th></tr></thead><tbody id="clientsBody"></tbody></table></div>
+      </article>
+      <div class="grid overview-grid" style="margin-top:14px">
+        <article class="card span-4"><div class="metric-label">KAPASITAS ACCESS POINT</div><div class="metric-value" id="capacityValue">—</div><div class="metric-foot">Klien terhubung / batas konfigurasi</div></article>
+        <article class="card span-4"><div class="metric-label">INTERFACE AP</div><div class="metric-value" id="apInterfaceValue">—</div><div class="metric-foot">Interface hostapd aktif</div></article>
+        <article class="card span-4"><div class="metric-label">GATEWAY</div><div class="metric-value" id="apGatewayValue">—</div><div class="metric-foot">Jaringan lokal hotspot</div></article>
+      </div>
+    </section>
+
+    <section class="page" id="page-network">
+      <div class="toolbar"><div><div class="eyebrow">CONNECTIVITY</div><h2>Jaringan & failover</h2></div><span class="pill" id="routePill">Upstream —</span></div>
+      <div class="grid overview-grid">
+        <article class="card span-7"><div class="card-head"><div><h2>Interface jaringan</h2><div class="card-sub">Alamat IPv4 dan status link</div></div></div>
+          <div class="table-wrap"><table><thead><tr><th>Interface</th><th>Status</th><th>Alamat IPv4</th><th>RX</th><th>TX</th></tr></thead><tbody id="interfacesBody"></tbody></table></div></article>
+        <article class="card span-5"><div class="card-head"><div><h2>Default routes</h2><div class="card-sub">Rute keluar yang dipilih kernel</div></div></div>
+          <div id="routesList" class="rows"></div></article>
+        <article class="card span-6"><div class="card-head"><div><h2>Modem & LTE</h2><div class="card-sub">Status ModemManager</div></div></div><div id="lteRows" class="rows"></div></article>
+        <article class="card span-6"><div class="card-head"><div><h2>Upstream throughput</h2><div class="card-sub">RX / TX rate pada route aktif · sampel 5 detik</div></div></div><div class="chart-wrap"><canvas id="interfaceChart"></canvas></div></article>
+      </div>
+    </section>
+
+    <section class="page" id="page-gps">
+      <div class="toolbar"><div><div class="eyebrow">POSITIONING</div><h2>GPS & lintasan lokal</h2></div><span class="pill" id="gpsStatusPill">GPS —</span></div>
+      <div class="grid overview-grid">
+        <article class="card span-8"><div class="card-head"><div><h2>Track perjalanan</h2><div class="card-sub">Sampai 500 posisi terbaru dari Redis Stream</div></div></div>
+          <div class="map-box" id="fullMap"><div class="map-note">Menunggu data GPS</div></div>
+          <div class="map-legend"><span>● Posisi terbaru</span><span>— Lintasan</span><span id="trackCount">0 titik</span></div>
+        </article>
+        <article class="card span-4"><div class="card-head"><div><h2>Fix GPS</h2><div class="card-sub">Informasi posisi terakhir</div></div></div><div id="gpsRows" class="rows"></div></article>
+        <article class="card span-12"><div class="card-head"><div><h2>Data mentah GPS</h2><div class="card-sub">Respons ModemManager terakhir yang tersimpan di Redis</div></div></div><pre id="gpsRaw">Belum ada data</pre></article>
+      </div>
+    </section>
+
+    <section class="page" id="page-system">
+      <div class="toolbar"><div><div class="eyebrow">DEVICE HEALTH</div><h2>Sistem & sumber daya</h2></div><span class="pill" id="deviceName">—</span></div>
+      <div class="grid overview-grid">
+        <article class="card span-6"><div class="card-head"><div><h2>Penggunaan sumber daya</h2><div class="card-sub">Snapshot kernel saat ini</div></div></div><div class="chart-wrap"><canvas id="resourceChart"></canvas></div></article>
+        <article class="card span-6"><div class="card-head"><div><h2>Ringkasan perangkat</h2><div class="card-sub">Sensor, kapasitas, dan load</div></div></div><div id="systemRows" class="rows"></div></article>
+        <article class="card span-12"><div class="card-head"><div><h2>Informasi sistem</h2><div class="card-sub">Kernel dan platform</div></div></div><pre id="platformInfo">—</pre></article>
+      </div>
+    </section>
+
+    <section class="page" id="page-security">
+      <div class="toolbar"><div><div class="eyebrow">OBSERVABILITY</div><h2>Keamanan & layanan</h2></div></div>
+      <div class="grid overview-grid">
+        <article class="card span-6"><div class="card-head"><div><h2>Service status</h2><div class="card-sub">Proses dan forwarding gateway</div></div></div><div class="service-grid" id="securityServices"></div></article>
+        <article class="card span-6"><div class="card-head"><div><h2>Firewall overview</h2><div class="card-sub">Status kebijakan jaringan</div></div></div><div id="firewallRows" class="rows"></div></article>
+        <article class="card span-12"><div class="card-head"><div><h2>Catatan akses</h2><div class="card-sub">Dashboard read-only; perubahan jaringan dilakukan dari POCO-TUI</div></div></div>
+          <p class="muted">Gunakan dashboard untuk memantau gateway. Pengaturan SSID, firewall, upstream, dan klien tetap dikelola dari antarmuka POCO-TUI agar aksi administratif tidak terbuka melalui web.</p></article>
+      </div>
+    </section>
+  </main>
+  <footer class="footer"><span>POCO-TUI · Mobile Edge Console</span><span>Read-only monitor · refresh otomatis setiap 5 detik</span></footer>
 </div>
-<main>
-  <section id="overview" class="view">
-    <div class="grid">
-      <div class="panel">
-        <h3>HOTSPOT</h3>
-        <div class="row"><span class="label">Status</span><span class="val good">● AKTIF</span></div>
-        <div class="row"><span class="label">SSID</span><span class="val">PocoF1-Hotspot</span></div>
-        <div class="row"><span class="label">Sandi</span><span class="val">**********</span></div>
-        <div class="row"><span class="label">Radio</span><span class="val">ap0  2.4 GHz  CH 6  WPA2</span></div>
-        <div class="row"><span class="label">Gateway</span><span class="val">192.168.50.1/24</span></div>
-        <div class="row"><span class="label">Upstream</span><span class="val">wlan0  10.x.x.x</span></div>
-        <div class="row"><span class="label">Internet</span><span class="val good">● online  42 ms</span></div>
-        <div class="row"><span class="label">Klien</span><span class="val">2 / 8</span></div>
-        <div class="row"><span class="label">hostapd</span><span class="val good">● aktif</span></div>
-        <div class="row"><span class="label">dnsmasq</span><span class="val good">● aktif</span></div>
-        <div class="row"><span class="label">ip_fwd</span><span class="val good">● 1</span></div>
-        <div class="row"><span class="label">NAT</span><span class="val">aktif</span></div>
-      </div>
-      <div class="panel">
-        <h3>SISTEM</h3>
-        <div class="row"><span class="label">CPU</span><div class="bar"><div style="width:34%"></div></div><span class="val">34%  1.8GHz</span></div>
-        <div class="row"><span class="label">RAM</span><div class="bar"><div style="width:52%"></div></div><span class="val">1.6/3.0 GB</span></div>
-        <div class="row"><span class="label">Baterai</span><div class="bar"><div style="width:78%;background:var(--good)"></div></div><span class="val">78%  Dipakai</span></div>
-        <div class="row"><span class="label">Disk</span><div class="bar"><div style="width:41%"></div></div><span class="val">4.1/10 GB</span></div>
-        <div class="row"><span class="label">Load</span><span class="val">0.42 0.38 0.31</span></div>
-        <div class="row"><span class="label">Suhu</span><span class="val">41.2°C</span></div>
-        <div class="row"><span class="label">Aktif</span><span class="val">02:14:33</span></div>
-      </div>
-      <div class="panel">
-        <h3>JARINGAN</h3>
-        <div class="row"><span class="label">↓ klien</span><span class="val">1.2 MB/s</span></div>
-        <div class="row"><span class="label">↑ klien</span><span class="val">0.3 MB/s</span></div>
-        <div class="row"><span class="label">↓ upstream</span><span class="val">0.4 MB/s</span></div>
-        <div class="row"><span class="label">↑ upstream</span><span class="val">1.1 MB/s</span></div>
-      </div>
-      <div class="panel">
-        <h3>MODEM / LTE / GPS</h3>
-        <div class="row"><span class="label">State</span><span class="val good">registered</span></div>
-        <div class="row"><span class="label">Access tech</span><span class="val">lte</span></div>
-        <div class="row"><span class="label">Signal</span><span class="val">78%</span></div>
-        <div class="row"><span class="label">Power</span><span class="val">on</span></div>
-        <div class="row"><span class="label">GPS</span><span class="val warn">tidak tersedia</span></div>
-      </div>
-    </div>
-  </section>
-  <section id="clients" class="view" hidden>
-    <div class="panel">
-      <h3>KLIEN TERHUBUNG</h3>
-      <table>
-        <thead><tr><th>MAC</th><th>IP</th><th>Hostname</th><th>RX/TX</th></tr></thead>
-        <tbody>
-          <tr><td>aa:bb:cc:dd:ee:01</td><td>192.168.50.101</td><td>phone-1</td><td>12 MB / 3 MB</td></tr>
-          <tr><td>aa:bb:cc:dd:ee:02</td><td>192.168.50.102</td><td>laptop</td><td>8 MB / 1 MB</td></tr>
-        </tbody>
-      </table>
-    </div>
-  </section>
-  <section id="net" class="view" hidden>
-    <div class="panel">
-      <h3>GRAFIK (sparkline placeholder)</h3>
-      <div class="log">↓ klien  ▁▂▃▅▇▆▅▃▂▁▂▃▅▇
-↑ klien  ▁▁▂▃▃▂▁▁▂▃▃▂▁▁
-↓ upstr  ▁▂▂▃▃▂▁▁▂▂▃▃▂▁
-↑ upstr  ▁▁▂▃▅▇▆▅▃▂▁▂▃▅</div>
-    </div>
-  </section>
-  <section id="lte" class="view" hidden>
-    <div class="panel">
-      <h3>LTE</h3>
-      <div class="row"><span class="label">Manufacturer</span><span class="val">QUALCOMM INCORPORATED</span></div>
-      <div class="row"><span class="label">Model</span><span class="val">0</span></div>
-      <div class="row"><span class="label">Firmware</span><span class="val">AT4.0.c2.6-00335</span></div>
-      <div class="row"><span class="label">State</span><span class="val good">registered</span></div>
-      <div class="row"><span class="label">Access tech</span><span class="val">lte</span></div>
-      <div class="row"><span class="label">Signal quality</span><span class="val">78%</span></div>
-      <div class="row"><span class="label">Power state</span><span class="val">on</span></div>
-    </div>
-  </section>
-  <section id="gps" class="view" hidden>
-    <div class="panel">
-      <h3>GPS</h3>
-      <div class="row"><span class="label">Status</span><span class="val warn">tidak tersedia (gpsd belum aktif)</span></div>
-    </div>
-  </section>
-  <section id="ids" class="view" hidden>
-    <div class="grid">
-      <div class="panel">
-        <h3>SNORT</h3>
-        <div class="row"><span class="label">Binary</span><span class="val good">/usr/sbin/snort</span></div>
-        <div class="row"><span class="label">Status</span><span class="val good">berjalan</span></div>
-        <div class="row"><span class="label">Config</span><span class="val">/etc/snort/snort.lua</span></div>
-      </div>
-      <div class="panel">
-        <h3>SURICATA</h3>
-        <div class="row"><span class="label">Binary</span><span class="val good">/usr/sbin/suricata</span></div>
-        <div class="row"><span class="label">Status</span><span class="val good">berjalan</span></div>
-        <div class="row"><span class="label">Config</span><span class="val">/etc/suricata/suricata.yaml</span></div>
-        <div class="row"><span class="label">Rules</span><span class="val">53359 loaded</span></div>
-      </div>
-    </div>
-    <div class="panel" style="margin-top:12px">
-      <h3>LOG (last 10)</h3>
-      <div class="log">11:56.233  ET INFO DNS Query to Alibaba Cloud CDN Domain
-11:56.646  ET INFO Observed Alibaba Cloud CDN Domain (TLS SNI)
-11:57.231  SURICATA Ethertype unknown
-11:57.232  SURICATA Ethertype unknown</div>
-    </div>
-  </section>
-</main>
-<div class="footer">POCO-TUI Web Dashboard — data simulasi. Refresh manual.</div>
+<div class="toast" id="toast"></div>
 <script>
-  const tabs=document.querySelectorAll('.tab');
-  tabs.forEach(t=>t.addEventListener('click',()=>{
-    tabs.forEach(x=>x.classList.remove('active'));
-    t.classList.add('active');
-    document.querySelectorAll('.view').forEach(v=>v.hidden=true);
-    document.getElementById(t.dataset.tab).hidden=false;
-  }));
-  function clock(){document.getElementById('clock').textContent=new Date().toLocaleTimeString('id-ID');}
-  clock();setInterval(clock,1000);
+(() => {
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const history = {labels: [], rx: [], tx: [], cpu: [], memory: []};
+  let latest = null;
+  let loading = false;
+  let lastError = "";
+  const formatBytes = value => {
+    let n = Number(value || 0), unit = 0, units = ["B","KB","MB","GB","TB"];
+    while (n >= 1024 && unit < units.length - 1) { n /= 1024; unit++; }
+    return `${n.toFixed(unit ? 1 : 0)} ${units[unit]}`;
+  };
+  const duration = value => {
+    const seconds = Math.max(0, Number(value || 0));
+    const days = Math.floor(seconds / 86400), hours = Math.floor(seconds % 86400 / 3600);
+    const minutes = Math.floor(seconds % 3600 / 60);
+    return days ? `${days}h ${hours}j` : hours ? `${hours}j ${minutes}m` : `${minutes}m`;
+  };
+  const timeLabel = value => value ? new Date(value).toLocaleString("id-ID", {hour12:false}) : "—";
+  const setText = (id, value) => { const el=$(id); if (el) el.textContent = value == null || value === "" ? "—" : String(value); };
+  const tone = (value, limit, highBad=true) => value == null ? "" : (highBad ? (value >= limit ? "bad" : value >= limit*.75 ? "warn" : "good") : (value <= limit ? "bad" : "good"));
+  function meter(id, value) {
+    const el=$(id); if (!el) return;
+    el.style.width = `${Math.max(0,Math.min(100,Number(value)||0))}%`;
+  }
+  function addRow(parent, label, value, cls="") {
+    const row=document.createElement("div"), name=document.createElement("span"), val=document.createElement("span");
+    row.className="row"; name.textContent=label; val.textContent=value == null || value === "" ? "—" : String(value);
+    if (cls) val.className=cls; row.append(name,val); parent.append(row);
+  }
+  function drawChart(id, series, colors) {
+    const canvas=$(id); if (!canvas) return;
+    const rect=canvas.getBoundingClientRect(), dpr=window.devicePixelRatio||1;
+    if (!rect.width || !rect.height) return;
+    canvas.width=Math.round(rect.width*dpr); canvas.height=Math.round(rect.height*dpr);
+    const ctx=canvas.getContext("2d"); ctx.scale(dpr,dpr);
+    const w=rect.width,h=rect.height,pad=20;
+    ctx.clearRect(0,0,w,h); ctx.strokeStyle="#1d3448"; ctx.lineWidth=1;
+    for(let i=0;i<4;i++){const y=pad+i*(h-pad*2)/3;ctx.beginPath();ctx.moveTo(pad,y);ctx.lineTo(w-pad,y);ctx.stroke();}
+    const max=Math.max(1,...series.flatMap(s=>s.values.filter(Number.isFinite)));
+    series.forEach((s,index)=>{
+      if(s.values.length<2)return;
+      ctx.beginPath();ctx.strokeStyle=colors[index];ctx.lineWidth=2;
+      s.values.forEach((v,i)=>{const x=pad+i*(w-pad*2)/(s.values.length-1);const y=h-pad-(Math.max(0,v)/max)*(h-pad*2);
+        if(i===0)ctx.moveTo(x,y);else ctx.lineTo(x,y);});
+      ctx.stroke();
+    });
+  }
+  function drawMap(id, points) {
+    const box=$(id); if(!box)return;
+    if(!points.length){box.replaceChildren(Object.assign(document.createElement("div"),{className:"map-note",textContent:"Belum ada posisi GPS valid tersimpan."}));return;}
+    const valid=points.filter(p=>Number.isFinite(Number(p.latitude))&&Number.isFinite(Number(p.longitude)));
+    if(!valid.length)return;
+    const lat0=Number(valid[valid.length-1].latitude), lon0=Number(valid[valid.length-1].longitude);
+    const lonScale=Math.max(.01,Math.cos(lat0*Math.PI/180));
+    const projected=valid.map(p=>({x:(((Number(p.longitude)-lon0+540)%360)-180)*lonScale,y:-(Number(p.latitude)-lat0)}));
+    const minX=Math.min(...projected.map(p=>p.x)),maxX=Math.max(...projected.map(p=>p.x));
+    const minY=Math.min(...projected.map(p=>p.y)),maxY=Math.max(...projected.map(p=>p.y));
+    const width=800,height=380,pad=48,dx=Math.max(1e-8,maxX-minX),dy=Math.max(1e-8,maxY-minY);
+    const scale=Math.min((width-2*pad)/dx,(height-2*pad)/dy);
+    const coords=projected.map(p=>({x:width/2+(p.x-(minX+maxX)/2)*scale,y:height/2+(p.y-(minY+maxY)/2)*scale}));
+    const svg=document.createElementNS("http://www.w3.org/2000/svg","svg");
+    svg.setAttribute("viewBox",`0 0 ${width} ${height}`);svg.setAttribute("role","img");svg.setAttribute("aria-label","Peta lintasan GPS lokal");
+    for(let i=1;i<8;i++){const x=i*width/8,y=i*height/8;for(const [x1,y1,x2,y2] of [[x,0,x,height],[0,y,width,y]]){const line=document.createElementNS(svg.namespaceURI,"line");line.setAttribute("x1",x1);line.setAttribute("y1",y1);line.setAttribute("x2",x2);line.setAttribute("y2",y2);line.setAttribute("class","map-grid");svg.append(line);}}
+    if(coords.length>1){const path=document.createElementNS(svg.namespaceURI,"polyline");path.setAttribute("points",coords.map(p=>`${p.x},${p.y}`).join(" "));path.setAttribute("class","map-path");svg.append(path);}
+    coords.slice(0,-1).filter((_,i)=>i%Math.max(1,Math.floor(coords.length/30))===0).forEach(p=>{const dot=document.createElementNS(svg.namespaceURI,"circle");dot.setAttribute("cx",p.x);dot.setAttribute("cy",p.y);dot.setAttribute("r","3");dot.setAttribute("class","map-point");svg.append(dot);});
+    const current=document.createElementNS(svg.namespaceURI,"circle");current.setAttribute("cx",coords[coords.length-1].x);current.setAttribute("cy",coords[coords.length-1].y);current.setAttribute("r","7");current.setAttribute("class","map-current");svg.append(current);
+    box.replaceChildren(svg);
+  }
+  function renderClients(clients, hotspot) {
+    const body=$("clientsBody");body.replaceChildren();
+    $("clientCountPill").textContent=`${hotspot.client_count} / ${hotspot.max_clients} klien`;
+    setText("capacityValue",`${hotspot.client_count} / ${hotspot.max_clients}`);
+    setText("apInterfaceValue",hotspot.ap_interface);setText("apGatewayValue",hotspot.gateway);
+    if(!clients.length){const tr=document.createElement("tr"),td=document.createElement("td");td.colSpan=7;td.className="empty";td.textContent="Belum ada klien yang terhubung.";tr.append(td);body.append(tr);return;}
+    clients.forEach(client=>{const tr=document.createElement("tr");
+      const values=[client.hostname||"Perangkat tanpa nama",client.ip||"—",client.mac||"—",
+        client.signal==null?"—":`${client.signal} dBm`,client.connected_time?duration(client.connected_time):"—",
+        formatBytes(client.rx_bytes),formatBytes(client.tx_bytes)];
+      values.forEach((value,i)=>{const td=document.createElement("td");td.textContent=value;if(i===0)td.style.fontWeight="600";tr.append(td);});body.append(tr);});
+  }
+  function renderServices(services, hotspot, firewall) {
+    const items=[["Hotspot",services.hostapd],["DHCP / DNS",services.dnsmasq],["Nftables",services.nftables],["IP forwarding",services.ip_forward],["Redis",services.redis],["Suricata",services.suricata]];
+    for(const id of ["serviceGrid","securityServices"]){const root=$(id);root.replaceChildren();items.forEach(([name,active])=>{const row=document.createElement("div");row.className="service";const dot=document.createElement("i");dot.className=`dot ${active?"live":"down"}`;const label=document.createElement("span");label.className="service-name";label.textContent=name;const state=document.createElement("span");state.className="service-state";state.textContent=active?"AKTIF":"MATI";row.append(dot,label,state);root.append(row);});}
+    const firewallRows=$("firewallRows");firewallRows.replaceChildren();
+    addRow(firewallRows,"Ruleset nftables",firewall.available?(firewall.active?"Terbaca":"Kosong"):"Tidak tersedia",firewall.active?"good":"warn");
+    addRow(firewallRows,"Tables / chains / rules",firewall.available?`${firewall.tables} / ${firewall.chains} / ${firewall.rules}`:firewall.reason||"—");
+    (firewall.base_chains||[]).forEach(chain=>addRow(firewallRows,`${chain.table}/${chain.name}`,`${chain.hook} · policy ${chain.policy||"—"}`));
+    addRow(firewallRows,"NAT hotspot (konfigurasi)",hotspot.nat?"Aktif":"Nonaktif",hotspot.nat?"good":"warn");
+    addRow(firewallRows,"IPv4 forwarding",services.ip_forward?"Aktif":"Mati",services.ip_forward?"good":"bad");
+    addRow(firewallRows,"Remote dashboard","HTTPS + password diwajibkan");
+  }
+  function renderNetwork(network, lte) {
+    setText("activeInterface",network.active_interface||"Tidak ada default route");setText("routePill",`Upstream ${network.active_interface||"—"}`);
+    const interfaces=$("interfacesBody");interfaces.replaceChildren();
+    network.interfaces.forEach(item=>{const counter=network.counters[item.name]||{},tr=document.createElement("tr");
+      [item.name,item.state,(item.addresses||[]).join(", ")||"—",formatBytes(counter.rx_bytes),formatBytes(counter.tx_bytes)].forEach(value=>{const td=document.createElement("td");td.textContent=value;tr.append(td);});interfaces.append(tr);});
+    if(!network.interfaces.length){const tr=document.createElement("tr"),td=document.createElement("td");td.colSpan=5;td.className="empty";td.textContent="Data interface tidak tersedia (iproute2).";tr.append(td);interfaces.append(tr);}
+    const routes=$("routesList");routes.replaceChildren();
+    network.default_routes.forEach(route=>{addRow(routes,route.interface||"default",`${route.gateway||"on-link"} · metric ${route.metric}`);});
+    if(!network.default_routes.length)addRow(routes,"Rute","Default route tidak ditemukan","warn");
+    const lteRows=$("lteRows");lteRows.replaceChildren();
+    [["Status",lte.state],["Operator",lte.operator],["Teknologi",lte.technology],["Sinyal",lte.signal],["Modem",lte.model]].forEach(([k,v])=>addRow(lteRows,k,v|| (lte.available?"—":"Modem tidak tersedia"),k==="Status"&&lte.available?"good":""));
+  }
+  function renderGps(gps) {
+    const record=gps.latest||{},location=record.parsed_location||{};
+    const track=gps.track||[];
+    drawMap("miniMap",track);drawMap("fullMap",track);
+    setText("gpsRedisState",gps.available?"Tersambung":gps.reason||"Tidak tersedia");
+    $("gpsRedisState").className=gps.available?"good":"warn";
+    setText("gpsStatusPill",gps.available?(location.latitude!=null?"Fix tersedia":"Data GPS tersedia"):"GPS tidak tersedia");
+    setText("gpsCoordinates",location.latitude==null?"Belum ada fix":`${Number(location.latitude).toFixed(6)}, ${Number(location.longitude).toFixed(6)}`);
+    setText("gpsAccuracy",location.hdop==null?"—":`HDOP ${location.hdop} · ${location.satellites||0} satelit`);
+    setText("gpsSpeed",location.speed_kmh==null?"—":`${Number(location.speed_kmh).toFixed(1)} km/j`);
+    setText("gpsTimestamp",timeLabel(record.timestamp));setText("trackCount",`${track.length} titik`);
+    const rows=$("gpsRows");rows.replaceChildren();
+    [["Status",location.fix?"Fix valid":"Menunggu fix"],["Latitude",location.latitude],["Longitude",location.longitude],["Altitude",location.altitude_m==null?null:`${location.altitude_m} m`],["Satellites",location.satellites],["HDOP",location.hdop],["Kecepatan",location.speed_kmh==null?null:`${location.speed_kmh} km/j`],["Waktu",timeLabel(record.timestamp)]].forEach(([k,v])=>addRow(rows,k,v));
+    $("gpsRaw").textContent=record.raw_gps_data||gps.reason||"Belum ada data GPS tersimpan.";
+  }
+  function renderSystem(system, hostname, power) {
+    const battery=system.battery||{},cpu=system.cpu_percent,memory=system.memory_percent;
+    setText("batteryValue",battery.percent==null?"—":`${battery.percent}%`);setText("batteryFoot",`${battery.status||"unknown"}${battery.charging?" · charger terpasang":""}`);
+    meter("batteryBar",battery.percent);$("batteryCard").className=`card metric span-4 ${battery.percent!=null&&battery.percent<=15?"bad-meter":""}`;
+    setText("cpuValue",cpu==null?"—":`${cpu.toFixed(1)}%`);setText("cpuFoot",`${(system.load||[]).map(v=>Number(v).toFixed(2)).join(" / ")||"Load unavailable"}`);meter("cpuBar",cpu);
+    setText("memoryValue",memory==null?"—":`${memory.toFixed(0)}%`);setText("memoryFoot",system.memory_used==null?"RAM":`${formatBytes(system.memory_used)} / ${formatBytes(system.memory_total)}`);meter("memoryBar",memory);
+    setText("temperatureValue",system.temperature_c==null?"—":`${system.temperature_c.toFixed(1)}°`);
+    setText("uptimeValue",duration(system.uptime_seconds));setText("loadFoot",`Load 1/5/15m · ${(system.load||[]).map(v=>Number(v).toFixed(2)).join(" / ")||"—"}`);
+    setText("deviceName",hostname);setText("platformInfo",`${system.platform||"Linux"}\n${hostname}\nServer time: ${timeLabel(Date.now())}`);
+    const rows=$("systemRows");rows.replaceChildren();
+    [["CPU",cpu==null?null:`${cpu}%`],["Profil CPU",power.profile.toUpperCase()],["Eco otomatis",power.automatic_eco?"aktif":"mati"],["RAM",system.memory_used==null?null:`${formatBytes(system.memory_used)} / ${formatBytes(system.memory_total)}`],["Disk",system.disk_percent==null?null:`${system.disk_percent}%`],["Suhu",system.temperature_c==null?null:`${system.temperature_c} °C`],["Baterai",battery.percent==null?null:`${battery.percent}% · ${battery.status}`],["Uptime",duration(system.uptime_seconds)],["Load",system.load.map(v=>Number(v).toFixed(2)).join(" / ")]].forEach(([k,v])=>addRow(rows,k,v));
+    history.cpu.push(cpu||0);history.memory.push(memory||0);trimHistory();
+    drawChart("resourceChart",[{values:history.cpu},{values:history.memory} ],["#51e0d0","#63a8ff"]);
+  }
+  function render(data) {
+    latest=data;
+    const {hotspot,system,network,lte,gps,services,power,firewall}=data;
+    const active=hotspot.active;
+    $("connectionDot").className=`dot live`;
+    setText("connectionText","LIVE");
+    setText("heroStatus",active?"Gateway online":"Hotspot offline");$("heroStatus").className=active?"good":"warn";
+    setText("heroDescription",`${data.hostname} · ${network.active_interface?"internet keluar melalui "+network.active_interface:"belum ada jalur upstream"}`);
+    setText("heroSsid",hotspot.ssid);setText("heroGateway",hotspot.gateway);setText("heroUpstream",network.active_interface||"—");
+    setText("heroClients",`${hotspot.client_count} / ${hotspot.max_clients}`);
+    setText("powerProfile",power.profile.toUpperCase()+(power.automatic_eco&&power.profile==="eco"?" · AUTO":""));
+    renderSystem(system,data.hostname,power);renderClients(hotspot.clients||[],hotspot);renderNetwork(network,lte);
+    renderGps(gps);renderServices(services,hotspot,firewall);
+    const selected=network.counters[network.active_interface]||{};
+    const now=data.timestamp,previous=history.previousNetwork;
+    const elapsed=previous?Math.max(.5,now-previous.timestamp):0;
+    history.rx.push(previous?Math.max(0,(selected.rx_bytes-previous.rx)/elapsed):0);
+    history.tx.push(previous?Math.max(0,(selected.tx_bytes-previous.tx)/elapsed):0);
+    history.previousNetwork={timestamp:now,rx:selected.rx_bytes||0,tx:selected.tx_bytes||0};trimHistory();
+    drawChart("trafficChart",[{values:history.rx},{values:history.tx}],["#51e0d0","#63a8ff"]);
+    drawChart("interfaceChart",[{values:history.rx},{values:history.tx}],["#51e0d0","#63a8ff"]);
+    renderPowerPolicies(power);
+    $("lastUpdate").textContent=`Diperbarui ${new Date(data.timestamp*1000).toLocaleTimeString("id-ID",{hour12:false})}`;
+  }
+  function trimHistory(){for(const key of ["labels","rx","tx","cpu","memory"])history[key]=history[key].slice(-40);}
+  function renderPowerPolicies(power){
+    const root=$("powerPolicies");root.replaceChildren();
+    if(!power.policies.length){const empty=document.createElement("div");empty.className="map-note";empty.textContent="Driver cpufreq tidak menyediakan informasi scaling.";root.append(empty);return;}
+    power.policies.forEach((policy,index)=>{const card=document.createElement("div");card.className="service";card.style.display="block";
+      const title=document.createElement("div");title.className="service-name";title.textContent=`${policy.cluster||`Cluster ${index+1}`} · CPU ${policy.cpus||"—"}`;
+      const detail=document.createElement("div");detail.className="service-state";detail.style.margin="8px 0 0";detail.textContent=`${policy.current_mhz||"—"} MHz sekarang · max ${policy.max_mhz||"—"} MHz · ${policy.governor||"—"}`;
+      card.append(title,detail);root.append(card);});
+  }
+  async function refresh() {
+    if(loading)return;loading=true;
+    try {const response=await fetch("/api/status",{cache:"no-store",credentials:"same-origin"});
+      if(!response.ok)throw new Error(`HTTP ${response.status}`);
+      const data=await response.json();render(data);lastError="";
+    } catch(error) {
+      $("connectionDot").className="dot down";setText("connectionText","OFFLINE");
+      if(lastError!==String(error)){toast(`Dashboard gagal memuat data: ${error.message}`);lastError=String(error);}
+    } finally {loading=false;}
+  }
+  function toast(message){const el=$("toast");el.textContent=message;el.classList.add("show");setTimeout(()=>el.classList.remove("show"),3500);}
+  document.querySelectorAll(".nav button").forEach(button=>button.addEventListener("click",()=>selectPage(button.dataset.page)));
+  document.querySelectorAll("[data-open]").forEach(button=>button.addEventListener("click",()=>selectPage(button.dataset.open)));
+  function selectPage(name){document.querySelectorAll(".nav button").forEach(b=>b.classList.toggle("active",b.dataset.page===name));document.querySelectorAll(".page").forEach(p=>p.classList.toggle("active",p.id===`page-${name}`));if(latest)requestAnimationFrame(()=>refresh());}
+  window.addEventListener("resize",()=>{if(latest)render(latest);});
+  refresh();setInterval(refresh,5000);
+})();
 </script>
 </body>
 </html>
