@@ -8,10 +8,16 @@ sentuh yang tidak terbaca.
 POCO-TUI terminal tidak memerlukan dependensi pip tambahan (menggunakan modul `curses` bawaan Python).
 Web dashboard berjalan dengan Streamlit.
 
-## Kredensial bot Telegram (opsional)
+## Bot Telegram (opsional)
 
 Jika menggunakan `telegram_bot.py`, salin `.env.example` menjadi `.env`, lalu isi
-`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, dan kredensial hotspot/LLM yang diperlukan.
+`TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID`, dan kredensial LLM bila diperlukan.
+Jalankan bot terpasang dengan `sudo telegram-bot` (atau `python3 telegram_bot.py` dari source).
+Secara default bot hanya menerima perintah dari chat pribadi pemilik (`TELEGRAM_CHAT_ID` harus sama
+dengan ID pengguna). Untuk grup, atur `TELEGRAM_ALLOWED_USER_ID` ke ID akun Telegram yang diizinkan;
+pesan pengguna grup lain akan diabaikan. Bot menyediakan status perangkat dan pemeriksaan baca-saja.
+Kontrol hotspot melalui Telegram sengaja dinonaktifkan agar tidak melewati pengelolaan nftables,
+failover, dan proteksi POCO-TUI. Perintah Docker/Podman dibatasi ke `ps`, `images`, dan statistik baca-saja.
 `OLLAMA_URL`, `OLLAMA_MODEL`, `REMOTE_URL`, dan `LLM_MODEL` mengatur endpoint serta
 model LLM; sesuaikan dengan layanan yang digunakan.
 `APN` menjadi nilai awal APN pada wizard profil LTE di POCO-TUI; kosongkan untuk
@@ -51,9 +57,16 @@ menghapusnya dari versi terbaru tidak menghapusnya dari riwayat Git.
 
 ```sh
 sudo ./install.sh                 # paket + program
+sudo ./install.sh --update        # perbarui program dari source lokal; paket dan konfigurasi dipertahankan
 sudo ./install.sh --autostart     # + otomatis tampilkan TUI di layar (tty1) saat boot
 ./pocotui.py --demo               # pratinjau di PC, data simulasi, tidak mengubah sistem
 ```
+
+`--update` memasang ulang berkas aplikasi—termasuk `telegram_bot.py`—dari working tree saat ini tanpa
+memperbarui paket atau menghapus konfigurasi. Jika dashboard berjalan, servicenya dimulai ulang; status
+service yang sebelumnya tidak aktif tetap dipertahankan. Opsi ini tidak mengambil perubahan dari Git;
+perbarui source terlebih dahulu bila diperlukan. Jika bot Telegram berjalan manual, hentikan dan mulai
+kembali proses bot setelah update agar memakai kode terbaru.
 
 Jika Streamlit sudah terpasang, installer mengaktifkan service dashboard saat boot secara default
 (`pocotui-dashboard` pada OpenRC atau `pocotui-dashboard.service` pada systemd). Dashboard bind hanya ke

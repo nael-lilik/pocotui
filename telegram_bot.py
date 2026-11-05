@@ -1,8 +1,19 @@
 #!/usr/bin/env python3
-"""Nura Telegram bot — cyberpunk neon edition."""
-import json, urllib.request, time, os, threading, sys, subprocess, shlex, tempfile
+"""POCO-TUI Telegram bot for status and read-only device checks."""
+import argparse
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import threading
+import time
+import urllib.request
 
-ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+PROJECT_ENV_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+ENV_FILE = os.environ.get("POCOTUI_ENV_FILE") or (
+    PROJECT_ENV_FILE if os.path.isfile(PROJECT_ENV_FILE) else "/etc/pocotui/.env"
+)
 
 
 def read_env_file():
@@ -43,6 +54,7 @@ load_env()
 
 TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "")
 CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "")
+ALLOWED_USER_ID = os.environ.get("TELEGRAM_ALLOWED_USER_ID", "")
 OLLAMA_URL = os.environ.get("OLLAMA_URL", "")
 OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "")
 REMOTE_URL = os.environ.get("REMOTE_URL", "")
@@ -50,31 +62,6 @@ MODEL = os.environ.get("LLM_MODEL", "")
 OFFSET = 0
 
 NEON = "⚡"
-
-
-def hotspot_creds():
-    return os.environ.get("HOTSPOT_SSID", "NuraHotspot"), os.environ.get("HOTSPOT_PASSWORD", "")
-
-
-def write_env_file(updates):
-    values = read_env_file()
-    values.update(updates)
-    content = "".join("%s=%s\n" % (key, shlex.quote(value)) for key, value in values.items())
-    fd, temp_path = tempfile.mkstemp(prefix=".env.", dir=os.path.dirname(ENV_FILE))
-    try:
-        with os.fdopen(fd, "w") as f:
-            f.write(content)
-        os.chmod(temp_path, 0o600)
-        os.replace(temp_path, ENV_FILE)
-    finally:
-        if os.path.exists(temp_path):
-            os.unlink(temp_path)
-
-
-def set_hotspot_cred(key, val):
-    env_key = {"ssid": "HOTSPOT_SSID", "password": "HOTSPOT_PASSWORD"}[key]
-    write_env_file({env_key: val})
-    os.environ[env_key] = val
 
 
 def tg(method, data=None):
@@ -104,7 +91,7 @@ def system_status():
     mem = run("free -h | awk '/^Mem:/{print $3\"/\"$2}'").strip()
     ip = run("ip -4 addr show 2>/dev/null | grep -oP 'inet \\K[\\d.]+' | head -1").strip()
     inet = "🟢 ONLINE" if "1 received" in run("ping -c1 -W2 8.8.8.8 2>/dev/null") else "🔴 OFFLINE"
-    return (f"{NEON} NURA STATUS {NEON}\n"
+    return (f"{NEON} POCO-TUI STATUS {NEON}\n"
             f"🔋 Battery : {bat}%\n🌡 Temp    : {temp}\n"
             f"⚙️ Load    : {load}\n🧠 Mem     : {mem}\n"
             f"🌐 IP      : {ip}\n📡 Net     : {inet}")
@@ -136,68 +123,63 @@ def ask_llm(prompt):
         return f"LLM error: {e}"
 
 
-def hotspot(on):
-    active = run("nmcli connection show --active 2>/dev/null").strip()
-    if on:
-        if "Hotspot" in active:
-            return "🔥 Hotspot already ON"
-        ssid, pw = hotspot_creds()
-        if not ssid or len(ssid.encode("utf-8")) > 32 or len(pw) < 8 or len(pw) > 63:
-            return "Hotspot credentials invalid; use a 1–32 byte HOTSPOT_SSID and an 8–63 character HOTSPOT_PASSWORD in .env"
-        src = run("ip route get 1.1.1.1 2>/dev/null | head -1").strip()
-        iface = src.split("dev", 1)[1].split()[0] if "dev" in src else "?"
-        saved = run("nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null").strip()
-        wifi_conn = ""
-        for line in saved.splitlines():
-            parts = line.split(":")
-            if len(parts) >= 2 and parts[1].startswith("wlan"):
-                wifi_conn = parts[0]; break
-        if wifi_conn:
-            run(f'printf "%s" "{wifi_conn}" > /tmp/nura_wifi_saved 2>/dev/null || true')
-        run("iw dev wlan0 interface add ap0 type __ap 2>/dev/null || true")
-        run("ip link set ap0 up 2>/dev/null || true")
-        run(["nmcli", "dev", "wifi", "hotspot", "ifname", "ap0", "ssid", ssid, "password", pw])
-        run("iptables -t nat -A POSTROUTING -o wlan0 -j MASQUERADE 2>/dev/null || true")
-        run("iptables -A FORWARD -i ap0 -o wlan0 -j ACCEPT 2>/dev/null || true")
-        run("iptables -A FORWARD -i wlan0 -o ap0 -m state --state RELATED,ESTABLISHED -j ACCEPT 2>/dev/null || true")
-        run("sysctl -w net.ipv4.ip_forward=1 2>/dev/null || true")
-        return f"🔥 Hotspot ON ({iface})\nSSID: {ssid}\nPW: {pw}"
-    else:
-        if "Hotspot" not in active:
-            return "❄️ Hotspot already OFF"
-        run("nmcli connection down Hotspot 2>&1 || true")
-        run("iw dev ap0 del 2>/dev/null || true")
-        saved = run("cat /tmp/nura_wifi_saved 2>/dev/null").strip()
-        if saved:
-            run(f'nmcli connection up "{saved}" 2>&1 || true')
-            run("rm -f /tmp/nura_wifi_saved")
-        return "❄️ Hotspot OFF — WiFi restored"
+def docker_cmd(command):
+    try:
+        args = tuple(shlex.split(command))
+    except ValueError:
+        return "Perintah container tidak valid."
+    allowed = {
+        ("ps",): ["ps"],
+        ("ps", "-a"): ["ps", "-a"],
+        ("images",): ["images"],
+        ("stats", "--no-stream"): ["stats", "--no-stream"],
+    }
+    if args not in allowed:
+        return "Hanya perintah baca-saja yang diizinkan: ps [-a], images, stats --no-stream."
+    for runtime in ("docker", "podman"):
+        executable = shutil.which(runtime)
+        if not executable:
+            continue
+        try:
+            result = subprocess.run(
+                [executable, *allowed[args]], capture_output=True, text=True, timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            return "Gagal menjalankan %s: %s" % (runtime, error)
+        if result.returncode == 0:
+            return (result.stdout or "").strip() or "(tidak ada output)"
+    return "Docker/Podman tidak tersedia atau perintah gagal."
 
 
-def docker_cmd(cmd):
-    out = run(f"docker {cmd} 2>&1 || podman {cmd} 2>&1")
-    return out.strip() or "(no output)"
+def is_authorized_message(message):
+    chat = message.get("chat", {})
+    sender = message.get("from", {})
+    chat_id = str(chat.get("id", ""))
+    sender_id = str(sender.get("id", ""))
+    if chat_id != CHAT_ID:
+        return False
+    if ALLOWED_USER_ID:
+        return sender_id == ALLOWED_USER_ID
+    return chat.get("type") == "private" and sender_id == CHAT_ID
+
+
+def hotspot_control_disabled():
+    return (
+        "Kontrol hotspot lewat Telegram dinonaktifkan agar tidak melewati konfigurasi "
+        "nftables, failover, dan fail-safe POCO-TUI. Gunakan menu Hotspot di POCO-TUI."
+    )
 
 
 def handle(text):
     t = text.lower().strip()
     if t in ("/status", "status"):
         return system_status()
-    if t in ("/hotspot on", "hotspot on"):
-        return hotspot(True)
-    if t in ("/hotspot off", "hotspot off"):
-        return hotspot(False)
-    if t.startswith("/hotspot ssid "):
-        val = text.split(" ", 2)[2]
-        set_hotspot_cred("ssid", val)
-        return f"✅ SSID → {val}"
-    if t.startswith("/hotspot password "):
-        val = text.split(" ", 2)[2]
-        set_hotspot_cred("password", val)
-        return f"✅ Password → {val}"
-    if t in ("/hotspot creds", "hotspot creds"):
-        ssid, pw = hotspot_creds()
-        return f"📶 SSID: {ssid}\n🔑 PW: {pw}"
+    if t in ("/hotspot on", "hotspot on", "/hotspot off", "hotspot off",
+             "/hotspot creds", "hotspot creds") or t.startswith(
+                 ("/hotspot ssid ", "/hotspot password ")
+             ):
+        return hotspot_control_disabled()
     if t.startswith("/ask ") or t.startswith("ask "):
         q = text.split(" ", 1)[1]
         return ask_llm(q)
@@ -224,11 +206,10 @@ def handle(text):
     if t in ("/help", "help"):
         return ("⚡ NURA COMMANDS ⚡\n"
                 "/status\n"
-                "/hotspot on | off | creds | clients\n"
-                "/hotspot ssid <name>\n"
-                "/hotspot password <pw>\n"
+                "/hotspot clients\n"
                 "/wifiscan\n/btscan\n/blescan\n"
-                "/docker <cmd>\n/containers\n/sms\n/lte\n/ask <q>\n/help")
+                "/containers\n/docker ps [-a] | images | stats --no-stream\n"
+                "/sms\n/lte\n/ask <q>\n/help")
     ctx = system_status()
     return ask_llm(f"Context:\n{ctx}\n\nUser: {text}")
 
@@ -253,10 +234,12 @@ def self_check():
 
 def main():
     global OFFSET
+    parser = argparse.ArgumentParser(description="POCO-TUI Telegram status bot")
+    parser.parse_args()
     missing = [key for key, value in (("TELEGRAM_BOT_TOKEN", TOKEN), ("TELEGRAM_CHAT_ID", CHAT_ID)) if not value]
     if missing:
         raise SystemExit("Missing required .env setting(s): %s" % ", ".join(missing))
-    tg("sendMessage", {"chat_id": CHAT_ID, "text": f"{NEON} Nura bot online {NEON}"})
+    tg("sendMessage", {"chat_id": CHAT_ID, "text": f"{NEON} POCO-TUI bot online {NEON}"})
     threading.Thread(target=self_check, daemon=True).start()
     while True:
         res = tg("getUpdates", {"offset": OFFSET, "timeout": 25})
@@ -264,8 +247,7 @@ def main():
             for u in res.get("result", []):
                 OFFSET = u["update_id"] + 1
                 msg = u.get("message", {})
-                chat = str(msg.get("chat", {}).get("id", ""))
-                if chat != CHAT_ID:
+                if not is_authorized_message(msg):
                     continue
                 text = msg.get("text", "")
                 if not text:

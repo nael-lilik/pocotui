@@ -3,6 +3,7 @@
 #
 #   ./install.sh                  pasang paket + program; dashboard web auto-start
 #   ./install.sh --autostart      ...dan jalankan otomatis di layar (tty1) saat boot
+#   ./install.sh --update         perbarui program dari source lokal tanpa memperbarui paket
 #   ./install.sh --uninstall      hapus program & kembalikan autostart
 #   ./install.sh --no-packages    lewati pemasangan paket (hanya salin file)
 #
@@ -11,16 +12,22 @@ set -e
 
 PREFIX="${PREFIX:-/usr/local}"
 DIR="$(cd "$(dirname "$0")" && pwd)"
-AUTOSTART=0; UNINSTALL=0; PACKAGES=1
+AUTOSTART=0; UNINSTALL=0; UPDATE=0; PACKAGES=1
 for a in "$@"; do
   case "$a" in
     --autostart) AUTOSTART=1 ;;
     --uninstall) UNINSTALL=1 ;;
+    --update) UPDATE=1 ;;
     --no-packages) PACKAGES=0 ;;
     -h|--help) sed -n '2,10p' "$0"; exit 0 ;;
     *) echo "Opsi tidak dikenal: $a"; exit 1 ;;
   esac
 done
+
+if [ "$UNINSTALL" = 1 ] && [ "$UPDATE" = 1 ]; then
+  echo "--update tidak dapat digunakan bersama --uninstall" >&2
+  exit 1
+fi
 
 [ "$(id -u)" = 0 ] || { echo "Harus dijalankan sebagai root (sudo/doas)."; exit 1; }
 
@@ -35,7 +42,7 @@ if [ "$UNINSTALL" = 1 ]; then
   rm -f "$PREFIX/bin/pocotui.py" "$PREFIX/bin/serve_dashboard.py" \
     "$PREFIX/bin/dashboard_streamlit.py" "$PREFIX/bin/dashboard.html" \
     "$PREFIX/bin/pocotui-dashboard" "$PREFIX/bin/pocotui_dashboard.py" \
-    "$PREFIX/bin/camera_stream.py"
+    "$PREFIX/bin/camera_stream.py" "$PREFIX/bin/telegram-bot"
   if [ -f "$DASHBOARD_UNIT" ]; then
     systemctl disable --now pocotui-dashboard.service 2>/dev/null || true
     rm -f "$DASHBOARD_UNIT"; systemctl daemon-reload 2>/dev/null || true
@@ -58,7 +65,9 @@ if [ "$UNINSTALL" = 1 ]; then
 fi
 
 # ---------------------------------------------------------------- paket
-if [ "$PACKAGES" = 1 ]; then
+if [ "$UPDATE" = 1 ]; then
+  echo "[1/3] Lewati paket (--update memperbarui program saja)"
+elif [ "$PACKAGES" = 1 ]; then
   echo "[1/3] Memasang paket"
   if command -v apk >/dev/null 2>&1; then
     for p in python3 hostapd dnsmasq iptables iproute2 iw rfkill redis ffmpeg libqrencode-tools \
@@ -93,6 +102,7 @@ install -m 644 "$DIR/dashboard_streamlit.py" "$PREFIX/bin/dashboard_streamlit.py
 install -m 644 "$DIR/dashboard.html" "$PREFIX/bin/dashboard.html"
 install -m 755 "$DIR/pocotui_dashboard.py" "$PREFIX/bin/pocotui-dashboard"
 install -m 644 "$DIR/pocotui_dashboard.py" "$PREFIX/bin/pocotui_dashboard.py"
+install -m 755 "$DIR/telegram_bot.py" "$PREFIX/bin/telegram-bot"
 cat > "$PREFIX/bin/pocotui-tty" <<EOF
 #!/bin/sh
 # Peluncur untuk layar fisik: font besar (layar HP beresolusi tinggi) + terminfo linux
@@ -108,10 +118,13 @@ EOF
 chmod 755 "$PREFIX/bin/pocotui-tty"
 
 # --------------------------------------------------------- dashboard service
-echo "[3/4] Mengaktifkan web dashboard saat boot"
+echo "[3/4] Memeriksa web dashboard"
 if command -v streamlit >/dev/null 2>&1; then
   if [ -d /run/systemd/system ] || command -v systemctl >/dev/null 2>&1 && [ ! -f "$INITTAB" ]; then
-    cat > "$DASHBOARD_UNIT" <<EOF
+    if [ "$UPDATE" = 1 ] && [ ! -f "$DASHBOARD_UNIT" ]; then
+      echo "    ! dashboard belum terpasang sebagai service; tidak mengaktifkannya saat update"
+    else
+      cat > "$DASHBOARD_UNIT" <<EOF
 [Unit]
 Description=POCO-TUI Streamlit web dashboard
 After=network.target
@@ -128,11 +141,24 @@ RestartSec=5
 [Install]
 WantedBy=multi-user.target
 EOF
-    systemctl daemon-reload
-    systemctl enable --now pocotui-dashboard.service
-    echo "    systemd: pocotui-dashboard.service aktif (localhost:7890)"
+      systemctl daemon-reload
+      if [ "$UPDATE" = 1 ]; then
+        if systemctl is-active --quiet pocotui-dashboard.service; then
+          systemctl restart pocotui-dashboard.service
+          echo "    systemd: pocotui-dashboard.service diperbarui dan dimulai ulang"
+        else
+          echo "    systemd: dashboard tidak aktif; status service dipertahankan"
+        fi
+      else
+        systemctl enable --now pocotui-dashboard.service
+        echo "    systemd: pocotui-dashboard.service aktif (localhost:7890)"
+      fi
+    fi
   elif command -v rc-update >/dev/null 2>&1 && command -v rc-service >/dev/null 2>&1; then
-    cat > "$DASHBOARD_INIT" <<EOF
+    if [ "$UPDATE" = 1 ] && [ ! -f "$DASHBOARD_INIT" ]; then
+      echo "    ! dashboard belum terpasang sebagai service; tidak mengaktifkannya saat update"
+    else
+      cat > "$DASHBOARD_INIT" <<EOF
 #!/sbin/openrc-run
 name="POCO-TUI Streamlit web dashboard"
 description="Read-only local POCO-TUI dashboard"
@@ -148,10 +174,20 @@ depend() {
     after bootmisc
 }
 EOF
-    chmod 755 "$DASHBOARD_INIT"
-    rc-update add pocotui-dashboard default
-    rc-service pocotui-dashboard start
-    echo "    OpenRC: pocotui-dashboard aktif (localhost:7890)"
+      chmod 755 "$DASHBOARD_INIT"
+      if [ "$UPDATE" = 1 ]; then
+        if rc-service pocotui-dashboard status >/dev/null 2>&1; then
+          rc-service pocotui-dashboard restart
+          echo "    OpenRC: pocotui-dashboard diperbarui dan dimulai ulang"
+        else
+          echo "    OpenRC: dashboard tidak aktif; status service dipertahankan"
+        fi
+      else
+        rc-update add pocotui-dashboard default
+        rc-service pocotui-dashboard start
+        echo "    OpenRC: pocotui-dashboard aktif (localhost:7890)"
+      fi
+    fi
   else
     echo "    ! init system tidak dikenali; jalankan $PREFIX/bin/pocotui-dashboard secara manual"
   fi
